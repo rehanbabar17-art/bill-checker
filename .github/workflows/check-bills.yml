@@ -1,0 +1,44 @@
+name: Check Utility Bills
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-bills:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - run: pip install requests
+      
+      # Persist bill state between runs without committing it to the repo.
+      # bill_state.json contains account refs + consumer names, so it must
+      # never be pushed to the (public) repository.
+      - name: Restore bill state
+        uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: bill_state.json
+          key: bill-state-v1
+      
+      - name: Check bills
+        env:
+          BILL_REFS: ${{ secrets.BILL_REFS }}
+          NTFY_KEY: ${{ secrets.NTFY_KEY }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: python check_bills.py
+      
+      - name: Save bill state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: bill_state.json
+          key: bill-state-v1
