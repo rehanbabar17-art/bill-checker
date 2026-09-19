@@ -322,7 +322,15 @@ def _check_sngpl_direct(consumer):
         f"&contype=NewCon&secs=ss7xa852op845&cats=ct456712337"
         f"&artcl=artuyh709123465"
     )
-    r = requests.get(url, timeout=TIMEOUT)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    proxy = _get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = requests.get(url, headers=headers, proxies=proxies, timeout=TIMEOUT)
     text = r.text
     tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
     cleaned = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
