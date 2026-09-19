@@ -368,15 +368,7 @@ def send_ntfy(ntfy_key, title, message):
         print(f"ntfy error: {e}")
         return False
 
-def should_check_today():
-    day = datetime.now().day
-    return day >= 20 or day <= 5
-
 def main():
-    if not should_check_today():
-        print(f"Today is day {datetime.now().day} -- skipping (only check 20th-5th)")
-        return 0
-
     config = load_config()
     state = load_state()
     changes = []
