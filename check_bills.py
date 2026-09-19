@@ -415,11 +415,34 @@ def main():
             print(f"  Error: {e}")
             errors.append(f"{name}: {str(e)}")
 
-    # SNGPL checking is disabled for now (user request).
-    # Existing SNGPL state entries are left untouched; they are not re-fetched
-    # and no SNGPL notifications are produced until this is re-enabled.
+    # Check SNGPL bills
     print("\n--- SNGPL Bills ---")
-    print("SKIPPED (SNGPL checking disabled per user request)")
+    for account in config.get("sngpl", []):
+        name = account["name"]
+        consumer = account["consumer"]
+        print(f"Checking {name} ({consumer})...")
+        try:
+            bill = check_sngpl_bill(consumer)
+            if bill is None:
+                print(f"  No bill data found")
+                errors.append(f"{name}: No data")
+                continue
+
+            key = f"sngpl_{consumer}"
+            old = state.get(key, {})
+            old_month = old.get("bill_month", "")
+            new_month = bill.get("bill_month", "")
+
+            if new_month != old_month:
+                print(f"  UPDATE: Rs. {bill['amount']} | {bill.get('bill_month', '')}")
+                changes.append({"type": "SNGPL", "name": name, "ref": consumer, "bill": bill})
+            else:
+                print(f"  Same (Rs. {bill['amount']})")
+
+            state[key] = bill
+        except Exception as e:
+            print(f"  Error: {e}")
+            errors.append(f"{name}: {str(e)}")
 
     save_state(state)
 
@@ -479,7 +502,7 @@ def main():
                 print(f"\ntfy send failed")
 
     print(f"\n--- Summary ---")
-    print(f"IESCO: {len(config['iesco'])} | SNGPL: disabled")
+    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)
