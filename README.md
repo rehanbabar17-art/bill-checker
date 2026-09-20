@@ -4,10 +4,11 @@ Automated IESCO electricity bill checker with ntfy notifications.
 
 ## Features
 - Checks configured IESCO accounts
-- Detects new bills and payment status changes
-- Sends ntfy notifications (name, ref no, amount, due date, paid/unpaid status)
-- Includes itemized bill calculation (per-unit rate, fixed charges, fuel surcharge, taxes)
-- Tracks bill history in `bill_state.json`
+- Detects new bills, amount changes, and payment status changes
+- Sends ntfy notifications with consumer name, reference number, bill month, amount, due date, and paid/unpaid status
+- Extracts the detailed IESCO QR payload from the official PITC bill page
+- Lists itemized charges: units, variable/fixed charges, meter/service rent, fuel surcharge, QTA, taxes, FPA, sanctioned load, and rate calculations
+- Tracks the complete bill response in `bill_state.json`
 
 ## Security / Privacy
 All account reference numbers are **secret** and never committed to this repo:
@@ -23,7 +24,19 @@ The workflow requires these repository secrets:
 |--------|---------|
 | `BILL_REFS` | JSON with account list, e.g. `{"iesco":[{"name":"KhalaLower","ref":"123..."}]}` |
 | `NTFY_KEY` | ntfy topic/key for notifications |
-| `PROXY_URL` | Optional proxy for PITC (unreliable from cloud IPs) |
+| `PROXY_URL` | Proxy (or comma-separated list) used for all bill-site requests |
+
+### Proxying
+The bill sites block many datacenter IP ranges, including GitHub Actions runners,
+so every request to a bill site goes through a proxy when one is configured:
+
+| Variable | Meaning |
+|----------|---------|
+| `PROXY_URL` / `PROXY_URLS` | One proxy URL, or several comma-separated; tried in order before a direct connection (`http://user:pass@host:port`, `socks5://...` with `requests[socks]`) |
+| `PROXY_ONLY` | `1` to never fall back to a direct connection |
+
+Standard `HTTPS_PROXY`/`HTTP_PROXY` are also honoured. Proxy credentials are
+masked in logs.
 
 ### Local run
 Create a local `config.json` (git-ignored) with the same structure, then:

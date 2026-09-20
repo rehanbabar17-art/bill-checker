@@ -3,6 +3,7 @@ import re
 import json
 import os
 import sys
+import html
 from datetime import datetime
 
 MONTH_NAMES = {
@@ -15,26 +16,29 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "bill_state.json")
 TIMEOUT = 15
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 def _env_int(name, default):
     try:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
 
-# bill.pitc.com.pk is slow/flaky and often blackholed from cloud IPs. Use a
-# short connect timeout (so unreachable hosts fail fast) with a generous
-# read timeout (the site can take 15-40s to answer). Overridable via env so
-# a proxy run can tune it without code changes.
+def _env_bool(name, default=False):
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
 PITC_CONNECT_TIMEOUT = _env_int("PITC_CONNECT_TIMEOUT", 10)
 PITC_READ_TIMEOUT = _env_int("PITC_READ_TIMEOUT", 45)
 PITC_RETRIES = _env_int("PITC_RETRIES", 2)
 PITC_TIMEOUT = (PITC_CONNECT_TIMEOUT, PITC_READ_TIMEOUT)
 
 def load_config():
-    # BILL_REFS env var (JSON) is the primary source on CI where the
-    # local config.json is not committed. Falls back to config.json for
-    # local runs. Format:
-    #   {"iesco":[{"name":"KhalaLower","ref":"..."}], "sngpl":[...]}
     env_refs = os.environ.get("BILL_REFS", "").strip()
     if env_refs:
         config = json.loads(env_refs)
@@ -55,7 +59,6 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 def normalize_iesco_month(value):
-    # "Aug 2026" or "AUG 26" -> "2026-08-01" to match stored state format
     value = value.strip()
     m = re.match(r"([A-Z][a-z]{2})\s+(\d{4})", value)
     if m and m.group(1) in MONTH_NAMES:
@@ -66,20 +69,16 @@ def normalize_iesco_month(value):
     return value
 
 def normalize_iesco_due_date(value):
-    # "31 AUG 26" -> "31 Aug 2026" to match stored state format
     m = re.match(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})$", value.strip())
     if m:
         return f"{m.group(1)} {m.group(2).title()} {2000 + int(m.group(3))}"
     return value
 
-
 def parse_charges_text(text):
-    """Parse the detailed charges_text from the PITC QR textarea into
-    a structured dict with energy details, taxes, FPA, and bill calc."""
     if not text:
         return None
+    text = html.unescape(text).replace("\xa0", " ")
     result = {}
-    # ENERGY DETAILS
     energy = {}
     for key in ("UNITS", "VARIABLE CHRG", "FIXED CHRG", "METER RENT",
                 "SERVICE RENT", "F.C. SUR", "QTA"):
@@ -88,11 +87,9 @@ def parse_charges_text(text):
             energy[key.lower().replace(".", "").replace(" ", "_")] = m.group(1)
     if energy:
         result["energy"] = energy
-    # Per-unit rate from BILL CALC section (e.g. "33.1000 X 212")
     calc_lines = re.findall(r'([\d.]+)\s*X\s*(\d+)', text)
     if calc_lines:
-        result["bill_calc"] = [f"{rate} \u00d7 {units} units" for rate, units in calc_lines]
-    # TAXES
+        result["bill_calc"] = [f"{rate} × {units} units" for rate, units in calc_lines]
     taxes = {}
     for key in ("ED", "TV FEE", "GST", "ITAX"):
         m = re.search(rf'{key}\s*:\s*([-\d.]+)', text)
@@ -102,12 +99,10 @@ def parse_charges_text(text):
                 taxes[key] = m.group(1)
     if taxes:
         result["taxes"] = taxes
-    # FPA DETAILS
     fpa = {}
     m = re.search(r'FPA_ENERGY\s*:\s*([-\d.]+)', text)
     if m and float(m.group(1)) != 0:
         fpa["fpa_energy"] = m.group(1)
-    # FPA GST (second GST in the FPA section)
     fpa_section = re.search(r'FPA EN DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
     if not fpa_section:
         fpa_section = re.search(r'FPA DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
@@ -115,17 +110,56 @@ def parse_charges_text(text):
         fpa["fpa_gst"] = fpa_section.group(1)
     if fpa:
         result["fpa"] = fpa
-    # SAN LOAD
     m = re.search(r'SAN LOAD\s*:\s*([-\d.]+)', text)
     if m:
         result["san_load"] = m.group(1)
     return result if result else None
 
-def _get_proxy():
-    for var in ("PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        val = os.environ.get(var, "").strip()
-        if val:
-            return val
+def proxy_list():
+    raw = []
+    for var in ("PROXY_URLS", "PROXY_URL", "HTTPS_PROXY", "https_proxy",
+                "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            raw.extend(part.strip() for part in value.split(","))
+    proxies, seen = [], set()
+    for proxy in raw:
+        if proxy and proxy not in seen:
+            seen.add(proxy)
+            proxies.append(proxy)
+    return proxies
+
+def _proxy_attempts():
+    attempts = proxy_list()
+    if not (attempts and _env_bool("PROXY_ONLY")):
+        attempts.append(None)
+    return attempts
+
+def _mask_proxy(proxy):
+    if not proxy:
+        return "direct"
+    return re.sub(r"//[^@/]+@", "//***@", proxy)
+
+def new_session(proxy=None):
+    session = requests.Session()
+    session.trust_env = False
+    session.headers["User-Agent"] = USER_AGENT
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    return session
+
+def via_proxies(fetch):
+    last_exc = None
+    for proxy in _proxy_attempts():
+        try:
+            result = fetch(new_session(proxy))
+            if result is not None:
+                return result
+        except Exception as e:
+            last_exc = e
+            print(f"  [{_mask_proxy(proxy)}] failed: {e}")
+    if last_exc is not None:
+        raise last_exc
     return None
 
 def _pitc_form_data(session):
@@ -136,27 +170,16 @@ def _pitc_form_data(session):
         value_match = re.search(r'value="([^"]*)"', m.group(0))
         data[name] = value_match.group(1) if value_match else ""
     if not data:
-        # Form did not load (truncated/error body); treat as failure so the
-        # caller can retry with a fresh session.
         raise RuntimeError("PITC form did not render")
     return data
 
 def check_iesco_official(ref):
-    # bill.pitc.com.pk is slow and flaky (can take 15-40s and sometimes
-    # returns a truncated page), so retry a few times with a fresh session
-    # and a generous timeout. Only a page that actually rendered the bill
-    # card counts as success.
+    return via_proxies(lambda session: _check_iesco_official(session, ref))
+
+def _check_iesco_official(session, ref):
     last_exc = None
     for attempt in range(1, PITC_RETRIES + 1):
         try:
-            session = requests.Session()
-            session.headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            proxy = _get_proxy()
-            if proxy:
-                session.proxies = {"http": proxy, "https": proxy}
             data = _pitc_form_data(session)
             data["rbSearchByList"] = "refno"
             data["searchTextBox"] = ref
@@ -172,7 +195,6 @@ def check_iesco_official(ref):
             if "Bill Not Found" in text:
                 return None
             if 'payable-card-amount' not in text and 'payable-card' not in text:
-                # Rendered page without the bill card (truncated/error body).
                 if attempt < PITC_RETRIES:
                     continue
                 return None
@@ -181,11 +203,7 @@ def check_iesco_official(ref):
             if not amt_match:
                 return None
 
-            result = {}
-            result["amount"] = amt_match.group(1).replace(",", "")
-
-            # PITC shows an "Amount Paid" block with a paid stamp once the
-            # bill is settled; otherwise the bill is still outstanding.
+            result = {"amount": amt_match.group(1).replace(",", "")}
             result["status"] = (
                 "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
             )
@@ -202,10 +220,9 @@ def check_iesco_official(ref):
             if name_match:
                 result["consumer_name"] = name_match.group(1).split(",")[0].strip()
 
-            charges_start = text.find('charges-breakdown-card')
+            charges_start = text.find("charges-breakdown-card")
             if charges_start != -1:
                 charges_section = text[charges_start:charges_start + 6000]
-                # Match each label/value pair in the breakdown grid.
                 items = re.findall(
                     r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
                     r'<span class="charges-bd-val[^"]*">(.*?)</span>',
@@ -216,40 +233,15 @@ def check_iesco_official(ref):
                     l = re.sub(r'<[^>]+>', '', label).strip()
                     v = re.sub(r'<[^>]+>', '', value).strip()
                     if l:
-                        parsed[l] = v
+                        parsed[html.unescape(l)] = html.unescape(v)
                 if parsed:
                     result["breakup"] = parsed
 
-            # Itemized cost breakdown (energy charges, subsidies, taxes, etc.)
-            # rendered in the "BILL CHARGES BREAKDOWN" card.
-            breakup = {}
-            charges_start = text.find('charges-breakdown-card')
-            if charges_start != -1:
-                charges_section = text[charges_start:charges_start + 6000]
-                # Match each label/value pair in the breakdown grid.
-                items = re.findall(
-                    r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
-                    r'<span class="charges-bd-val[^"]*">(.*?)</span>',
-                    charges_section, re.DOTALL,
-                )
-                parsed = {}
-                for label, value in items:
-                    l = re.sub(r'<[^>]+>', '', label).strip()
-                    v = re.sub(r'<[^>]+>', '', value).strip()
-                    if l:
-                        parsed[l] = v
-                if parsed:
-                    result["breakup"] = parsed
-
-            # Detailed charges from the hidden QR textarea — includes per-unit
-            # rate, fixed charges, fuel surcharge, GST, FPA, and the actual
-            # multiplication shown in "BILL CALC".
             charges_qr = re.search(
-                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>',
-                text, re.DOTALL,
+                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
             )
             if charges_qr:
-                result["charges_text"] = charges_qr.group(1).strip()
+                result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
                 parsed = parse_charges_text(result["charges_text"])
                 if parsed:
                     result["calc"] = parsed
@@ -272,15 +264,11 @@ def check_iesco_playwright(ref):
 
     try:
         with sync_playwright() as p:
-            proxy_url = _get_proxy()
+            proxies = proxy_list()
+            proxy_url = proxies[0] if proxies else None
             proxy_arg = {"server": proxy_url} if proxy_url else None
             browser = p.chromium.launch(headless=True, proxy=proxy_arg)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
-            )
+            context = browser.new_context(user_agent=USER_AGENT)
             page = context.new_page()
             page.goto("https://bill.pitc.com.pk/iescobill", timeout=PITC_READ_TIMEOUT * 1000)
             page.fill("input[name='searchTextBox'], #searchTextBox", ref)
@@ -329,7 +317,7 @@ def check_iesco_playwright(ref):
                     l = re.sub(r'<[^>]+>', '', label).strip()
                     v = re.sub(r'<[^>]+>', '', value).strip()
                     if l:
-                        parsed[l] = v
+                        parsed[html.unescape(l)] = html.unescape(v)
                 if parsed:
                     result["breakup"] = parsed
 
@@ -338,7 +326,7 @@ def check_iesco_playwright(ref):
                 text, re.DOTALL,
             )
             if charges_qr:
-                result["charges_text"] = charges_qr.group(1).strip()
+                result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
                 parsed = parse_charges_text(result["charges_text"])
                 if parsed:
                     result["calc"] = parsed
@@ -358,7 +346,7 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
-    # Fallback 1: Official HTTP requests
+    # Fallback 1: Official HTTP requests via proxies
     try:
         bill = check_iesco_official(ref)
         if bill is not None:
@@ -367,13 +355,20 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
-    # Fallback 2: onlinebill.com.pk
-    r = requests.post(
-        "https://onlinebill.com.pk/view-iesco-bill/",
-        data={"reference": ref},
-        timeout=TIMEOUT,
-    )
-    text = r.text
+    # Fallback 2: onlinebill.com.pk via proxies
+    try:
+        text = via_proxies(
+            lambda session: session.post(
+                "https://onlinebill.com.pk/view-iesco-bill/",
+                data={"reference": ref},
+                timeout=TIMEOUT,
+            ).text
+        )
+    except Exception:
+        text = None
+
+    if not text:
+        return None
     result = {}
 
     amt_match = re.search(r"Payable within due date.*?Rs\.\s*([\d,]+)", text, re.DOTALL)
@@ -392,10 +387,6 @@ def check_iesco_bill(ref):
     if due_match:
         result["due_date"] = due_match.group(1)
 
-    # Onlinebill only shows an "Amount paid" field once the bill has been
-    # paid; its absence does NOT prove the bill is unpaid (it simply lacks
-    # that data for some accounts). So only record a status when there is
-    # actual payment evidence, and leave it unknown otherwise.
     if re.search(r">\s*Amount paid\s*<", text):
         result["status"] = "PAID"
 
@@ -405,30 +396,21 @@ def check_iesco_bill(ref):
     return result
 
 def check_sngpl_bill(consumer):
-    try:
-        bill = _check_sngpl_direct(consumer)
-        if bill is not None:
-            return bill
-    except Exception:
-        pass
+    consumer = str(consumer).strip()
+    sources = [_check_sngpl_direct, _check_sngpl_sngpl_bill_pk, _check_sngpl_onlinebill]
+    for src in sources:
+        try:
+            bill = src(consumer)
+            if bill is not None and bill.get("amount"):
+                return bill
+        except Exception:
+            continue
+    return None
 
-    try:
-        return _check_sngpl_fallback(consumer)
-    except Exception:
+def _parse_sngpl_html(text):
+    if not text:
         return None
-
-def _check_sngpl_fallback(consumer):
-    url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
-    data = {"action": "gasbill_sngpl", "consumer": consumer}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    r = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
-    text = r.text
-    if "Unable to load" in text or "No bill found" in text or "Invalid request" in text:
+    if "Unable to load" in text or "No bill found" in text or "Invalid" in text:
         return None
 
     tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
@@ -436,27 +418,61 @@ def _check_sngpl_fallback(consumer):
     result = {}
 
     for i, td in enumerate(cleaned):
-        if td == 'Name:' and i + 2 < len(cleaned):
+        if td.lower() in ('name:', 'consumer name:') and i + 2 < len(cleaned):
             result['consumer_name'] = cleaned[i + 2]
             break
 
-    for i, td in enumerate(cleaned):
-        if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td):
+    for td in cleaned:
+        if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td, re.IGNORECASE):
             result['bill_month'] = td
             break
 
     amounts = [td for td in cleaned if re.match(r'^\d{1,3}(,\d{3})*$', td)]
     if amounts:
-        result['amount'] = amounts[0]
+        result['amount'] = amounts[0].replace(',', '')
 
     for td in cleaned:
-        if re.match(r'^\d{2}-\d{2}-\d{4}$', td):
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', td) or re.match(r'^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$', td):
             result['due_date'] = td
             break
 
     if not result.get('amount'):
-        return None
-    return result
+        amt_match = re.search(r'(?:Payable|Amount)\s*[:\s]*Rs\.\s*([\d,]+)', text, re.IGNORECASE)
+        if amt_match:
+            result['amount'] = amt_match.group(1).replace(',', '')
+
+        due_match = re.search(r'Due Date\s*[:\s]*([\d]{1,2}[-/\s][A-Za-z0-9]{3,}[-/\s][\d]{2,4})', text, re.IGNORECASE)
+        if due_match:
+            result['due_date'] = due_match.group(1)
+
+        month_match = re.search(r'Bill Month\s*[:\s]*([A-Za-z]{3}\s+\d{4})', text, re.IGNORECASE)
+        if month_match:
+            result['bill_month'] = month_match.group(1)
+
+    return result if result.get('amount') else None
+
+def _check_sngpl_sngpl_bill_pk(consumer):
+    url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
+    data = {"action": "gasbill_sngpl", "consumer": consumer}
+    headers = {
+        "Referer": "https://sngpl-bill.pk/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    return via_proxies(
+        lambda session: _parse_sngpl_html(
+            session.post(url, data=data, headers=headers, timeout=TIMEOUT).text
+        )
+    )
+
+def _check_sngpl_onlinebill(consumer):
+    url = "https://onlinebill.com.pk/sngpl-bill/"
+    data = {"reference": consumer, "type": "sngpl"}
+    headers = {"Referer": "https://onlinebill.com.pk/sngpl-bill/"}
+    return via_proxies(
+        lambda session: _parse_sngpl_html(
+            session.post(url, data=data, headers=headers, timeout=TIMEOUT).text
+        )
+    )
 
 def _check_sngpl_direct(consumer):
     urls = [
@@ -473,53 +489,19 @@ def _check_sngpl_direct(consumer):
             f"&artcl=artuyh709123465"
         )
     ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    proxy = _get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, proxies=proxies, timeout=TIMEOUT)
-            text = r.text
-            if not text:
+    def fetch(session):
+        for url in urls:
+            try:
+                r = session.get(url, timeout=TIMEOUT)
+                parsed = _parse_sngpl_html(r.text)
+                if parsed and parsed.get("amount"):
+                    return parsed
+            except Exception:
                 continue
-            tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
-            cleaned = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
-            result = {}
+        return None
 
-            for i, td in enumerate(cleaned):
-                if td == 'Name:' and i + 2 < len(cleaned):
-                    result['consumer_name'] = cleaned[i + 2]
-                    break
-
-            for i, td in enumerate(cleaned):
-                if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td):
-                    result['bill_month'] = td
-                    break
-
-            amounts = []
-            for td in cleaned:
-                if re.match(r'^\d{1,3}(,\d{3})*$', td):
-                    amounts.append(td)
-            if amounts:
-                result['amount'] = amounts[0]
-
-            for td in cleaned:
-                if re.match(r'^\d{2}-\d{2}-\d{4}$', td):
-                    result['due_date'] = td
-                    break
-
-            if result.get('amount'):
-                return result
-        except Exception:
-            continue
-
-    return None
+    return via_proxies(fetch)
 
 def send_ntfy(ntfy_key, title, message):
     url = f"https://ntfy.sh/{ntfy_key}"
@@ -541,18 +523,28 @@ def main():
     changes = []
     errors = []
 
-    print(f"=== Bill Check: {datetime.now().strftime('%Y-%m-%d %H:%M')} ===\n")
+    print(f"=== Bill Check: {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    proxies = proxy_list()
+    if proxies:
+        print("Proxies: " + ", ".join(_mask_proxy(p) for p in proxies)
+              + (" (proxy only)" if _env_bool("PROXY_ONLY") else " then direct"))
+    else:
+        print("Proxies: none configured (direct connections)")
+    print()
 
-    # Check IESCO bills
     print("--- IESCO Bills ---")
-    for account in config["iesco"]:
-        name = account["name"]
-        ref = account["ref"]
+    for account in config.get("iesco") or []:
+        name = account.get("name", "IESCO")
+        ref = account.get("ref") or account.get("consumer", "")
+        if not ref:
+            print(f"Checking {name}... Error: missing reference number")
+            errors.append(f"{name}: Missing ref")
+            continue
         print(f"Checking {name} ({ref})...")
         try:
             bill = check_iesco_bill(ref)
             if bill is None:
-                print(f"  No bill data found")
+                print("  No bill data found")
                 errors.append(f"{name}: No data")
                 continue
 
@@ -561,16 +553,16 @@ def main():
             old = state.get(key, {})
             old_month = old.get("bill_month", "")
             old_status = old.get("status", "")
+            old_amount = str(old.get("amount", ""))
             new_month = bill.get("bill_month", "")
             status_known = "status" in bill
             new_status = bill.get("status", "")
+            new_amount = str(bill.get("amount", ""))
             if not status_known:
-                # No reliable payment info from any source: keep the last
-                # known status instead of guessing, and do not report a
-                # status change.
                 bill["status"] = old_status
 
-            if new_month != old_month or (status_known and new_status != old_status):
+            if (new_month != old_month or new_amount != old_amount or
+                    (status_known and new_status != old_status)):
                 print(f"  UPDATE: Rs. {bill['amount']} | {bill.get('bill_month', '')} | {bill.get('status', '')}")
                 changes.append({"type": "IESCO", "name": name, "ref": ref, "bill": bill})
             else:
@@ -582,16 +574,19 @@ def main():
             print(f"  Error: {e}")
             errors.append(f"{name}: {str(e)}")
 
-    # Check SNGPL bills
     print("\n--- SNGPL Bills ---")
-    for account in config.get("sngpl", []):
-        name = account["name"]
-        consumer = account["consumer"]
+    for account in (config.get("sngpl") or []):
+        name = account.get("name", "SNGPL")
+        consumer = account.get("consumer") or account.get("ref", "")
+        if not consumer:
+            print(f"Checking {name}... Error: missing consumer/ref number")
+            errors.append(f"{name}: Missing consumer number")
+            continue
         print(f"Checking {name} ({consumer})...")
         try:
             bill = check_sngpl_bill(consumer)
             if bill is None:
-                print(f"  No bill data found")
+                print("  No bill data found")
                 errors.append(f"{name}: No data")
                 continue
 
@@ -623,31 +618,31 @@ def main():
                 block = (
                     f"{ch['name']}\n"
                     f"Ref: {ch['ref']}\n"
+                    f"Consumer: {b.get('consumer_name', 'N/A')}\n"
+                    f"Bill month: {b.get('bill_month', 'N/A')}\n"
                     f"Amount: Rs. {b.get('amount', 'N/A')}\n"
                     f"Due: {b.get('due_date', 'N/A')}"
                     + (f"\nStatus: {status}" if status else "")
                 )
                 breakup = b.get("breakup")
                 if breakup:
-                    parts = []
-                    for k, v in breakup.items():
-                        parts.append(f"  {k}: Rs. {v}")
+                    parts = [f"  {k}: Rs. {v}" for k, v in breakup.items()]
                     block += "\nBreakup:\n" + "\n".join(parts)
                 calc = b.get("calc")
                 if calc:
                     parts = []
                     if "energy" in calc:
                         e = calc["energy"]
-                        if "units" in e:
-                            parts.append(f"  Units: {e['units']}")
-                        if "fixed_chrg" in e:
-                            parts.append(f"  Fixed Charge: Rs. {e['fixed_chrg']}")
-                        if "variable_chrg" in e:
-                            parts.append(f"  Variable Charge: Rs. {e['variable_chrg']}")
-                        if "fc_sur" in e:
-                            parts.append(f"  Fuel Surcharge: Rs. {e['fc_sur']}")
-                        if "qta" in e:
-                            parts.append(f"  Subsidy (QTA): Rs. {e['qta']}")
+                        labels = {
+                            "units": "Units", "fixed_chrg": "Fixed Charge",
+                            "variable_chrg": "Variable Charge", "meter_rent": "Meter Rent",
+                            "service_rent": "Service Rent", "fc_sur": "Fuel Surcharge",
+                            "qta": "Subsidy (QTA)",
+                        }
+                        for key, label in labels.items():
+                            if key in e:
+                                suffix = "" if key == "units" else "Rs. "
+                                parts.append(f"  {label}: {suffix}{e[key]}")
                     if "taxes" in calc:
                         for tk, tv in calc["taxes"].items():
                             parts.append(f"  {tk}: Rs. {tv}")
@@ -659,17 +654,18 @@ def main():
                         parts.append(f"  Rate: {' / '.join(calc['bill_calc'])}")
                     if "san_load" in calc:
                         parts.append(f"  Sanctioned Load: {calc['san_load']} kW")
-                    block += "\nCalculation:\n" + "\n".join(parts)
+                    if parts:
+                        block += "\nCalculation:\n" + "\n".join(parts)
                 lines.append(block)
             msg = "\n\n".join(lines)
             title = f"{len(changes)} Bill Update(s)"
             if send_ntfy(ntfy_key, title, msg):
                 print(f"\ntfy sent for {len(changes)} change(s)")
             else:
-                print(f"\ntfy send failed")
+                print("\ntfy send failed")
 
-    print(f"\n--- Summary ---")
-    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
+    print("\n--- Summary ---")
+    print(f"IESCO: {len(config.get('iesco') or [])} | SNGPL: {len(config.get('sngpl') or [])}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)

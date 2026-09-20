@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.11'
       
-      - run: pip install requests playwright
+      - run: pip install 'requests[socks]' playwright
       - run: python -m playwright install --with-deps chromium
       
       # Persist bill state between runs without committing it to the repo.
@@ -35,6 +35,8 @@ jobs:
           BILL_REFS: ${{ secrets.BILL_REFS }}
           NTFY_KEY: ${{ secrets.NTFY_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_URLS: ${{ secrets.PROXY_URLS }}
+          PROXY_ONLY: ${{ vars.PROXY_ONLY }}
         run: python check_bills.py
       
       - name: Save bill state
