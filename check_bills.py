@@ -33,20 +33,12 @@ def _env_bool(name, default=False):
         return default
     return val in ("1", "true", "yes", "on")
 
-# bill.pitc.com.pk is slow/flaky and often blackholed from cloud IPs. Use a
-# short connect timeout (so unreachable hosts fail fast) with a generous
-# read timeout (the site can take 15-40s to answer). Overridable via env so
-# a proxy run can tune it without code changes.
 PITC_CONNECT_TIMEOUT = _env_int("PITC_CONNECT_TIMEOUT", 10)
 PITC_READ_TIMEOUT = _env_int("PITC_READ_TIMEOUT", 45)
 PITC_RETRIES = _env_int("PITC_RETRIES", 2)
 PITC_TIMEOUT = (PITC_CONNECT_TIMEOUT, PITC_READ_TIMEOUT)
 
 def load_config():
-    # BILL_REFS env var (JSON) is the primary source on CI where the
-    # local config.json is not committed. Falls back to config.json for
-    # local runs. Format:
-    #   {"iesco":[{"name":"KhalaLower","ref":"..."}], "sngpl":[...]}
     env_refs = os.environ.get("BILL_REFS", "").strip()
     if env_refs:
         config = json.loads(env_refs)
@@ -67,7 +59,6 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 def normalize_iesco_month(value):
-    # "Aug 2026" or "AUG 26" -> "2026-08-01" to match stored state format
     value = value.strip()
     m = re.match(r"([A-Z][a-z]{2})\s+(\d{4})", value)
     if m and m.group(1) in MONTH_NAMES:
@@ -78,22 +69,16 @@ def normalize_iesco_month(value):
     return value
 
 def normalize_iesco_due_date(value):
-    # "31 AUG 26" -> "31 Aug 2026" to match stored state format
     m = re.match(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})$", value.strip())
     if m:
         return f"{m.group(1)} {m.group(2).title()} {2000 + int(m.group(3))}"
     return value
 
-
 def parse_charges_text(text):
-    """Parse the detailed charges_text from the PITC QR textarea into
-    a structured dict with energy details, taxes, FPA, and bill calc."""
     if not text:
         return None
-    # The QR textarea can contain HTML entities such as &amp; or &nbsp;.
     text = html.unescape(text).replace("\xa0", " ")
     result = {}
-    # ENERGY DETAILS
     energy = {}
     for key in ("UNITS", "VARIABLE CHRG", "FIXED CHRG", "METER RENT",
                 "SERVICE RENT", "F.C. SUR", "QTA"):
@@ -102,11 +87,9 @@ def parse_charges_text(text):
             energy[key.lower().replace(".", "").replace(" ", "_")] = m.group(1)
     if energy:
         result["energy"] = energy
-    # Per-unit rate from BILL CALC section (e.g. "33.1000 X 212")
     calc_lines = re.findall(r'([\d.]+)\s*X\s*(\d+)', text)
     if calc_lines:
         result["bill_calc"] = [f"{rate} × {units} units" for rate, units in calc_lines]
-    # TAXES
     taxes = {}
     for key in ("ED", "TV FEE", "GST", "ITAX"):
         m = re.search(rf'{key}\s*:\s*([-\d.]+)', text)
@@ -116,12 +99,10 @@ def parse_charges_text(text):
                 taxes[key] = m.group(1)
     if taxes:
         result["taxes"] = taxes
-    # FPA DETAILS
     fpa = {}
     m = re.search(r'FPA_ENERGY\s*:\s*([-\d.]+)', text)
     if m and float(m.group(1)) != 0:
         fpa["fpa_energy"] = m.group(1)
-    # FPA GST (second GST in the FPA section)
     fpa_section = re.search(r'FPA EN DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
     if not fpa_section:
         fpa_section = re.search(r'FPA DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
@@ -129,15 +110,12 @@ def parse_charges_text(text):
         fpa["fpa_gst"] = fpa_section.group(1)
     if fpa:
         result["fpa"] = fpa
-    # SAN LOAD
     m = re.search(r'SAN LOAD\s*:\s*([-\d.]+)', text)
     if m:
         result["san_load"] = m.group(1)
     return result if result else None
 
 def proxy_list():
-    """Proxy URLs from env, in priority order. PROXY_URL/PROXY_URLS may hold a
-    comma-separated list so several proxies can be tried in turn."""
     raw = []
     for var in ("PROXY_URLS", "PROXY_URL", "HTTPS_PROXY", "https_proxy",
                 "HTTP_PROXY", "http_proxy"):
@@ -164,7 +142,6 @@ def _mask_proxy(proxy):
 
 def new_session(proxy=None):
     session = requests.Session()
-    # Proxy selection is explicit, so ignore ambient *_proxy env vars.
     session.trust_env = False
     session.headers["User-Agent"] = USER_AGENT
     if proxy:
@@ -172,9 +149,6 @@ def new_session(proxy=None):
     return session
 
 def via_proxies(fetch):
-    """Call fetch(session) once per proxy candidate (proxies first, then a
-    direct connection) and return the first non-None result. The bill sites
-    routinely block datacenter/CI IP ranges, so a proxy is tried up front."""
     last_exc = None
     for proxy in _proxy_attempts():
         try:
@@ -187,6 +161,20 @@ def via_proxies(fetch):
     if last_exc is not None:
         raise last_exc
     return None
+
+def _pitc_form_data(session):
+    r = session.get("https://bill.pitc.com.pk/iescobill", timeout=PITC_TIMEOUT)
+    data = {}
+    for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*>', r.text):
+        name = m.group(1)
+        value_match = re.search(r'value="([^"]*)"', m.group(0))
+        data[name] = value_match.group(1) if value_match else ""
+    if not data:
+        raise RuntimeError("PITC form did not render")
+    return data
+
+def check_iesco_official(ref):
+    return via_proxies(lambda session: _check_iesco_official(session, ref))
 
 def parse_iesco_official_html(text):
     if not text:
@@ -234,8 +222,6 @@ def parse_iesco_official_html(text):
         if parsed:
             result["breakup"] = parsed
 
-    # This hidden textarea is the detailed QR payload: energy charges,
-    # rates, taxes, FPA and sanctioned load.
     charges_qr = re.search(
         r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
     )
@@ -246,17 +232,6 @@ def parse_iesco_official_html(text):
             result["calc"] = parsed
 
     return result
-
-def _pitc_form_data(session):
-    r = session.get("https://bill.pitc.com.pk/iescobill", timeout=PITC_TIMEOUT)
-    data = {}
-    for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*>', r.text):
-        name = m.group(1)
-        value_match = re.search(r'value="([^"]*)"', m.group(0))
-        data[name] = value_match.group(1) if value_match else ""
-    if not data:
-        raise RuntimeError("PITC form did not render")
-    return data
 
 def check_iesco_lumiproxy(ref, timeout=60):
     """Fetch IESCO bill via LumiProxy web proxy using Playwright browser automation."""
@@ -277,13 +252,11 @@ def check_iesco_lumiproxy(ref, timeout=60):
             page.goto("https://www.lumiproxy.com/online-proxy/proxysite/", timeout=timeout * 1000)
             page.wait_for_timeout(1000)
 
-            # Accept terms/cookie banner if present
             agree_btn = page.locator('button.el-button:has-text("Agree")')
             if agree_btn.is_visible():
                 agree_btn.click()
                 page.wait_for_timeout(500)
 
-            # Select Pakistan as proxy location
             select_box = page.locator('.el-select').first
             select_box.click()
             page.wait_for_timeout(500)
@@ -293,17 +266,14 @@ def check_iesco_lumiproxy(ref, timeout=60):
                 pak_opt.click()
                 page.wait_for_timeout(500)
 
-            # Enter PITC website URL
             url_input = page.locator('input[placeholder*="Enter web address"]')
             url_input.fill("https://bill.pitc.com.pk/iescobill")
 
-            # Click GO button and wait for popup window
             with page.expect_popup(timeout=timeout * 1000) as popup_info:
                 page.locator('.search_wrapper .btn').click()
 
             popup = popup_info.value
 
-            # Wait for PITC iframe in popup window
             frame = None
             max_wait_frame = 30
             for _ in range(max_wait_frame):
@@ -319,24 +289,20 @@ def check_iesco_lumiproxy(ref, timeout=60):
                 browser.close()
                 return None
 
-            # Fill reference number in searchTextBox inside iframe
             ref_input = frame.locator('#searchTextBox, input[name="searchTextBox"]')
             ref_input.wait_for(state="visible", timeout=timeout * 1000)
 
             ref_input.fill(ref)
 
-            # Select refno radio option if present
             rb = frame.locator('input[value="refno"], #rbSearchByList_0')
             if rb.count() > 0:
                 rb.first.click()
 
-            # Submit search
             search_btn = frame.locator('#btnSearch, input[name="btnSearch"]')
             search_btn.click()
 
             page.wait_for_timeout(5000)
 
-            # Wait for bill response elements or error text
             for _ in range(20):
                 content = frame.content()
                 if ("payable-card-amount" in content or "payable-card" in content or
@@ -351,9 +317,6 @@ def check_iesco_lumiproxy(ref, timeout=60):
     except Exception as e:
         print(f"  [LumiProxy] Error: {e}")
         return None
-
-def check_iesco_official(ref):
-    return via_proxies(lambda session: _check_iesco_official(session, ref))
 
 def _check_iesco_official(session, ref):
     last_exc = None
@@ -387,6 +350,7 @@ def _check_iesco_official(session, ref):
     return None
 
 def check_iesco_bill(ref):
+    # Primary method: LumiProxy browser automation via Playwright
     try:
         bill = check_iesco_lumiproxy(ref)
         if bill is not None:
@@ -395,6 +359,7 @@ def check_iesco_bill(ref):
     except Exception as e:
         print(f"  LumiProxy failed: {e}")
 
+    # Fallback 1: Official HTTP requests via proxies
     try:
         bill = check_iesco_official(ref)
         if bill is not None:
@@ -403,13 +368,18 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
-    text = via_proxies(
-        lambda session: session.post(
-            "https://onlinebill.com.pk/view-iesco-bill/",
-            data={"reference": ref},
-            timeout=TIMEOUT,
-        ).text
-    )
+    # Fallback 2: onlinebill.com.pk via proxies
+    try:
+        text = via_proxies(
+            lambda session: session.post(
+                "https://onlinebill.com.pk/view-iesco-bill/",
+                data={"reference": ref},
+                timeout=TIMEOUT,
+            ).text
+        )
+    except Exception:
+        text = None
+
     if not text:
         return None
     result = {}
@@ -480,7 +450,6 @@ def _parse_sngpl_html(text):
             break
 
     if not result.get('amount'):
-        # Fallback regex parsing if table structure varies
         amt_match = re.search(r'(?:Payable|Amount)\s*[:\s]*Rs\.\s*([\d,]+)', text, re.IGNORECASE)
         if amt_match:
             result['amount'] = amt_match.group(1).replace(',', '')
@@ -577,9 +546,13 @@ def main():
     print()
 
     print("--- IESCO Bills ---")
-    for account in config["iesco"]:
-        name = account["name"]
-        ref = account["ref"]
+    for account in config.get("iesco") or []:
+        name = account.get("name", "IESCO")
+        ref = account.get("ref") or account.get("consumer", "")
+        if not ref:
+            print(f"Checking {name}... Error: missing reference number")
+            errors.append(f"{name}: Missing ref")
+            continue
         print(f"Checking {name} ({ref})...")
         try:
             bill = check_iesco_bill(ref)
@@ -601,8 +574,6 @@ def main():
             if not status_known:
                 bill["status"] = old_status
 
-            # Send a new notification when any important bill identity changes,
-            # including a corrected amount, not just month/status.
             if (new_month != old_month or new_amount != old_amount or
                     (status_known and new_status != old_status)):
                 print(f"  UPDATE: Rs. {bill['amount']} | {bill.get('bill_month', '')} | {bill.get('status', '')}")
@@ -617,9 +588,13 @@ def main():
             errors.append(f"{name}: {str(e)}")
 
     print("\n--- SNGPL Bills ---")
-    for account in config.get("sngpl", []):
-        name = account["name"]
-        consumer = account["consumer"]
+    for account in (config.get("sngpl") or []):
+        name = account.get("name", "SNGPL")
+        consumer = account.get("consumer") or account.get("ref", "")
+        if not consumer:
+            print(f"Checking {name}... Error: missing consumer/ref number")
+            errors.append(f"{name}: Missing consumer number")
+            continue
         print(f"Checking {name} ({consumer})...")
         try:
             bill = check_sngpl_bill(consumer)
@@ -703,7 +678,7 @@ def main():
                 print("\ntfy send failed")
 
     print("\n--- Summary ---")
-    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
+    print(f"IESCO: {len(config.get('iesco') or [])} | SNGPL: {len(config.get('sngpl') or [])}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)
