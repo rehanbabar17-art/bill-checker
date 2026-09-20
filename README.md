@@ -24,7 +24,19 @@ The workflow requires these repository secrets:
 |--------|---------|
 | `BILL_REFS` | JSON with account list, e.g. `{"iesco":[{"name":"KhalaLower","ref":"123..."}]}` |
 | `NTFY_KEY` | ntfy topic/key for notifications |
-| `PROXY_URL` | Optional proxy for PITC (unreliable from cloud IPs) |
+| `PROXY_URL` | Proxy (or comma-separated list) used for all bill-site requests |
+
+### Proxying
+The bill sites block many datacenter IP ranges, including GitHub Actions runners,
+so every request to a bill site goes through a proxy when one is configured:
+
+| Variable | Meaning |
+|----------|---------|
+| `PROXY_URL` / `PROXY_URLS` | One proxy URL, or several comma-separated; tried in order before a direct connection (`http://user:pass@host:port`, `socks5://...` with `requests[socks]`) |
+| `PROXY_ONLY` | `1` to never fall back to a direct connection |
+
+Standard `HTTPS_PROXY`/`HTTP_PROXY` are also honoured. Proxy credentials are
+masked in logs.
 
 ### Local run
 Create a local `config.json` (git-ignored) with the same structure, then:
