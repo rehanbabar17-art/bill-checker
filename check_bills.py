@@ -310,30 +310,21 @@ def check_iesco_bill(ref):
     return result
 
 def check_sngpl_bill(consumer):
-    try:
-        bill = _check_sngpl_direct(consumer)
-        if bill is not None:
-            return bill
-    except Exception:
-        pass
+    consumer = str(consumer).strip()
+    sources = [_check_sngpl_direct, _check_sngpl_sngpl_bill_pk, _check_sngpl_onlinebill]
+    for src in sources:
+        try:
+            bill = src(consumer)
+            if bill is not None and bill.get("amount"):
+                return bill
+        except Exception:
+            continue
+    return None
 
-    try:
-        return _check_sngpl_fallback(consumer)
-    except Exception:
+def _parse_sngpl_html(text):
+    if not text:
         return None
-
-def _check_sngpl_fallback(consumer):
-    url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
-    data = {"action": "gasbill_sngpl", "consumer": consumer}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    r = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
-    text = r.text
-    if "Unable to load" in text or "No bill found" in text or "Invalid request" in text:
+    if "Unable to load" in text or "No bill found" in text or "Invalid" in text:
         return None
 
     tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
@@ -341,27 +332,70 @@ def _check_sngpl_fallback(consumer):
     result = {}
 
     for i, td in enumerate(cleaned):
-        if td == 'Name:' and i + 2 < len(cleaned):
+        if td.lower() in ('name:', 'consumer name:') and i + 2 < len(cleaned):
             result['consumer_name'] = cleaned[i + 2]
             break
 
-    for i, td in enumerate(cleaned):
-        if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td):
+    for td in cleaned:
+        if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td, re.IGNORECASE):
             result['bill_month'] = td
             break
 
     amounts = [td for td in cleaned if re.match(r'^\d{1,3}(,\d{3})*$', td)]
     if amounts:
-        result['amount'] = amounts[0]
+        result['amount'] = amounts[0].replace(',', '')
 
     for td in cleaned:
-        if re.match(r'^\d{2}-\d{2}-\d{4}$', td):
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', td) or re.match(r'^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$', td):
             result['due_date'] = td
             break
 
     if not result.get('amount'):
-        return None
-    return result
+        # Fallback regex parsing if table structure varies
+        amt_match = re.search(r'(?:Payable|Amount)\s*[:\s]*Rs\.\s*([\d,]+)', text, re.IGNORECASE)
+        if amt_match:
+            result['amount'] = amt_match.group(1).replace(',', '')
+
+        due_match = re.search(r'Due Date\s*[:\s]*([\d]{1,2}[-/\s][A-Za-z0-9]{3,}[-/\s][\d]{2,4})', text, re.IGNORECASE)
+        if due_match:
+            result['due_date'] = due_match.group(1)
+
+        month_match = re.search(r'Bill Month\s*[:\s]*([A-Za-z]{3}\s+\d{4})', text, re.IGNORECASE)
+        if month_match:
+            result['bill_month'] = month_match.group(1)
+
+    return result if result.get('amount') else None
+
+def _check_sngpl_sngpl_bill_pk(consumer):
+    url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
+    data = {"action": "gasbill_sngpl", "consumer": consumer}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://sngpl-bill.pk/",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    proxy = _get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = requests.post(url, data=data, headers=headers, proxies=proxies, timeout=TIMEOUT)
+    return _parse_sngpl_html(r.text)
+
+def _check_sngpl_onlinebill(consumer):
+    url = "https://onlinebill.com.pk/sngpl-bill/"
+    data = {"reference": consumer, "type": "sngpl"}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://onlinebill.com.pk/sngpl-bill/"
+    }
+    proxy = _get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = requests.post(url, data=data, headers=headers, proxies=proxies, timeout=TIMEOUT)
+    return _parse_sngpl_html(r.text)
 
 def _check_sngpl_direct(consumer):
     urls = [
@@ -390,37 +424,9 @@ def _check_sngpl_direct(consumer):
     for url in urls:
         try:
             r = requests.get(url, headers=headers, proxies=proxies, timeout=TIMEOUT)
-            text = r.text
-            if not text:
-                continue
-            tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
-            cleaned = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
-            result = {}
-
-            for i, td in enumerate(cleaned):
-                if td == 'Name:' and i + 2 < len(cleaned):
-                    result['consumer_name'] = cleaned[i + 2]
-                    break
-
-            for i, td in enumerate(cleaned):
-                if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td):
-                    result['bill_month'] = td
-                    break
-
-            amounts = []
-            for td in cleaned:
-                if re.match(r'^\d{1,3}(,\d{3})*$', td):
-                    amounts.append(td)
-            if amounts:
-                result['amount'] = amounts[0]
-
-            for td in cleaned:
-                if re.match(r'^\d{2}-\d{2}-\d{4}$', td):
-                    result['due_date'] = td
-                    break
-
-            if result.get('amount'):
-                return result
+            parsed = _parse_sngpl_html(r.text)
+            if parsed and parsed.get("amount"):
+                return parsed
         except Exception:
             continue
 
