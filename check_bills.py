@@ -3,6 +3,7 @@ import re
 import json
 import os
 import sys
+import html
 from datetime import datetime
 
 MONTH_NAMES = {
@@ -78,6 +79,8 @@ def parse_charges_text(text):
     a structured dict with energy details, taxes, FPA, and bill calc."""
     if not text:
         return None
+    # The QR textarea can contain HTML entities such as &amp; or &nbsp;.
+    text = html.unescape(text).replace("\xa0", " ")
     result = {}
     # ENERGY DETAILS
     energy = {}
@@ -91,7 +94,7 @@ def parse_charges_text(text):
     # Per-unit rate from BILL CALC section (e.g. "33.1000 X 212")
     calc_lines = re.findall(r'([\d.]+)\s*X\s*(\d+)', text)
     if calc_lines:
-        result["bill_calc"] = [f"{rate} \u00d7 {units} units" for rate, units in calc_lines]
+        result["bill_calc"] = [f"{rate} × {units} units" for rate, units in calc_lines]
     # TAXES
     taxes = {}
     for key in ("ED", "TV FEE", "GST", "ITAX"):
@@ -136,16 +139,10 @@ def _pitc_form_data(session):
         value_match = re.search(r'value="([^"]*)"', m.group(0))
         data[name] = value_match.group(1) if value_match else ""
     if not data:
-        # Form did not load (truncated/error body); treat as failure so the
-        # caller can retry with a fresh session.
         raise RuntimeError("PITC form did not render")
     return data
 
 def check_iesco_official(ref):
-    # bill.pitc.com.pk is slow and flaky (can take 15-40s and sometimes
-    # returns a truncated page), so retry a few times with a fresh session
-    # and a generous timeout. Only a page that actually rendered the bill
-    # card counts as success.
     last_exc = None
     for attempt in range(1, PITC_RETRIES + 1):
         try:
@@ -172,7 +169,6 @@ def check_iesco_official(ref):
             if "Bill Not Found" in text:
                 return None
             if 'payable-card-amount' not in text and 'payable-card' not in text:
-                # Rendered page without the bill card (truncated/error body).
                 if attempt < PITC_RETRIES:
                     continue
                 return None
@@ -181,11 +177,7 @@ def check_iesco_official(ref):
             if not amt_match:
                 return None
 
-            result = {}
-            result["amount"] = amt_match.group(1).replace(",", "")
-
-            # PITC shows an "Amount Paid" block with a paid stamp once the
-            # bill is settled; otherwise the bill is still outstanding.
+            result = {"amount": amt_match.group(1).replace(",", "")}
             result["status"] = (
                 "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
             )
@@ -202,10 +194,9 @@ def check_iesco_official(ref):
             if name_match:
                 result["consumer_name"] = name_match.group(1).split(",")[0].strip()
 
-            charges_start = text.find('charges-breakdown-card')
+            charges_start = text.find("charges-breakdown-card")
             if charges_start != -1:
                 charges_section = text[charges_start:charges_start + 6000]
-                # Match each label/value pair in the breakdown grid.
                 items = re.findall(
                     r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
                     r'<span class="charges-bd-val[^"]*">(.*?)</span>',
@@ -216,40 +207,17 @@ def check_iesco_official(ref):
                     l = re.sub(r'<[^>]+>', '', label).strip()
                     v = re.sub(r'<[^>]+>', '', value).strip()
                     if l:
-                        parsed[l] = v
+                        parsed[html.unescape(l)] = html.unescape(v)
                 if parsed:
                     result["breakup"] = parsed
 
-            # Itemized cost breakdown (energy charges, subsidies, taxes, etc.)
-            # rendered in the "BILL CHARGES BREAKDOWN" card.
-            breakup = {}
-            charges_start = text.find('charges-breakdown-card')
-            if charges_start != -1:
-                charges_section = text[charges_start:charges_start + 6000]
-                # Match each label/value pair in the breakdown grid.
-                items = re.findall(
-                    r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
-                    r'<span class="charges-bd-val[^"]*">(.*?)</span>',
-                    charges_section, re.DOTALL,
-                )
-                parsed = {}
-                for label, value in items:
-                    l = re.sub(r'<[^>]+>', '', label).strip()
-                    v = re.sub(r'<[^>]+>', '', value).strip()
-                    if l:
-                        parsed[l] = v
-                if parsed:
-                    result["breakup"] = parsed
-
-            # Detailed charges from the hidden QR textarea — includes per-unit
-            # rate, fixed charges, fuel surcharge, GST, FPA, and the actual
-            # multiplication shown in "BILL CALC".
+            # This hidden textarea is the detailed QR payload: energy charges,
+            # rates, taxes, FPA and sanctioned load.
             charges_qr = re.search(
-                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>',
-                text, re.DOTALL,
+                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
             )
             if charges_qr:
-                result["charges_text"] = charges_qr.group(1).strip()
+                result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
                 parsed = parse_charges_text(result["charges_text"])
                 if parsed:
                     result["calc"] = parsed
@@ -297,10 +265,6 @@ def check_iesco_bill(ref):
     if due_match:
         result["due_date"] = due_match.group(1)
 
-    # Onlinebill only shows an "Amount paid" field once the bill has been
-    # paid; its absence does NOT prove the bill is unpaid (it simply lacks
-    # that data for some accounts). So only record a status when there is
-    # actual payment evidence, and leave it unknown otherwise.
     if re.search(r">\s*Amount paid\s*<", text):
         result["status"] = "PAID"
 
@@ -448,7 +412,6 @@ def main():
 
     print(f"=== Bill Check: {datetime.now().strftime('%Y-%m-%d %H:%M')} ===\n")
 
-    # Check IESCO bills
     print("--- IESCO Bills ---")
     for account in config["iesco"]:
         name = account["name"]
@@ -457,7 +420,7 @@ def main():
         try:
             bill = check_iesco_bill(ref)
             if bill is None:
-                print(f"  No bill data found")
+                print("  No bill data found")
                 errors.append(f"{name}: No data")
                 continue
 
@@ -466,16 +429,18 @@ def main():
             old = state.get(key, {})
             old_month = old.get("bill_month", "")
             old_status = old.get("status", "")
+            old_amount = str(old.get("amount", ""))
             new_month = bill.get("bill_month", "")
             status_known = "status" in bill
             new_status = bill.get("status", "")
+            new_amount = str(bill.get("amount", ""))
             if not status_known:
-                # No reliable payment info from any source: keep the last
-                # known status instead of guessing, and do not report a
-                # status change.
                 bill["status"] = old_status
 
-            if new_month != old_month or (status_known and new_status != old_status):
+            # Send a new notification when any important bill identity changes,
+            # including a corrected amount, not just month/status.
+            if (new_month != old_month or new_amount != old_amount or
+                    (status_known and new_status != old_status)):
                 print(f"  UPDATE: Rs. {bill['amount']} | {bill.get('bill_month', '')} | {bill.get('status', '')}")
                 changes.append({"type": "IESCO", "name": name, "ref": ref, "bill": bill})
             else:
@@ -487,7 +452,6 @@ def main():
             print(f"  Error: {e}")
             errors.append(f"{name}: {str(e)}")
 
-    # Check SNGPL bills
     print("\n--- SNGPL Bills ---")
     for account in config.get("sngpl", []):
         name = account["name"]
@@ -496,7 +460,7 @@ def main():
         try:
             bill = check_sngpl_bill(consumer)
             if bill is None:
-                print(f"  No bill data found")
+                print("  No bill data found")
                 errors.append(f"{name}: No data")
                 continue
 
@@ -528,31 +492,31 @@ def main():
                 block = (
                     f"{ch['name']}\n"
                     f"Ref: {ch['ref']}\n"
+                    f"Consumer: {b.get('consumer_name', 'N/A')}\n"
+                    f"Bill month: {b.get('bill_month', 'N/A')}\n"
                     f"Amount: Rs. {b.get('amount', 'N/A')}\n"
                     f"Due: {b.get('due_date', 'N/A')}"
                     + (f"\nStatus: {status}" if status else "")
                 )
                 breakup = b.get("breakup")
                 if breakup:
-                    parts = []
-                    for k, v in breakup.items():
-                        parts.append(f"  {k}: Rs. {v}")
+                    parts = [f"  {k}: Rs. {v}" for k, v in breakup.items()]
                     block += "\nBreakup:\n" + "\n".join(parts)
                 calc = b.get("calc")
                 if calc:
                     parts = []
                     if "energy" in calc:
                         e = calc["energy"]
-                        if "units" in e:
-                            parts.append(f"  Units: {e['units']}")
-                        if "fixed_chrg" in e:
-                            parts.append(f"  Fixed Charge: Rs. {e['fixed_chrg']}")
-                        if "variable_chrg" in e:
-                            parts.append(f"  Variable Charge: Rs. {e['variable_chrg']}")
-                        if "fc_sur" in e:
-                            parts.append(f"  Fuel Surcharge: Rs. {e['fc_sur']}")
-                        if "qta" in e:
-                            parts.append(f"  Subsidy (QTA): Rs. {e['qta']}")
+                        labels = {
+                            "units": "Units", "fixed_chrg": "Fixed Charge",
+                            "variable_chrg": "Variable Charge", "meter_rent": "Meter Rent",
+                            "service_rent": "Service Rent", "fc_sur": "Fuel Surcharge",
+                            "qta": "Subsidy (QTA)",
+                        }
+                        for key, label in labels.items():
+                            if key in e:
+                                suffix = "" if key == "units" else "Rs. "
+                                parts.append(f"  {label}: {suffix}{e[key]}")
                     if "taxes" in calc:
                         for tk, tv in calc["taxes"].items():
                             parts.append(f"  {tk}: Rs. {tv}")
@@ -564,16 +528,17 @@ def main():
                         parts.append(f"  Rate: {' / '.join(calc['bill_calc'])}")
                     if "san_load" in calc:
                         parts.append(f"  Sanctioned Load: {calc['san_load']} kW")
-                    block += "\nCalculation:\n" + "\n".join(parts)
+                    if parts:
+                        block += "\nCalculation:\n" + "\n".join(parts)
                 lines.append(block)
             msg = "\n\n".join(lines)
             title = f"{len(changes)} Bill Update(s)"
             if send_ntfy(ntfy_key, title, msg):
                 print(f"\ntfy sent for {len(changes)} change(s)")
             else:
-                print(f"\ntfy send failed")
+                print("\ntfy send failed")
 
-    print(f"\n--- Summary ---")
+    print("\n--- Summary ---")
     print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 

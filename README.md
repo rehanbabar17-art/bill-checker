@@ -4,10 +4,11 @@ Automated IESCO electricity bill checker with ntfy notifications.
 
 ## Features
 - Checks configured IESCO accounts
-- Detects new bills and payment status changes
-- Sends ntfy notifications (name, ref no, amount, due date, paid/unpaid status)
-- Includes itemized bill calculation (per-unit rate, fixed charges, fuel surcharge, taxes)
-- Tracks bill history in `bill_state.json`
+- Detects new bills, amount changes, and payment status changes
+- Sends ntfy notifications with consumer name, reference number, bill month, amount, due date, and paid/unpaid status
+- Extracts the detailed IESCO QR payload from the official PITC bill page
+- Lists itemized charges: units, variable/fixed charges, meter/service rent, fuel surcharge, QTA, taxes, FPA, sanctioned load, and rate calculations
+- Tracks the complete bill response in `bill_state.json`
 
 ## Security / Privacy
 All account reference numbers are **secret** and never committed to this repo:
