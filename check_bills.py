@@ -188,6 +188,65 @@ def via_proxies(fetch):
         raise last_exc
     return None
 
+def parse_iesco_official_html(text):
+    if not text:
+        return None
+    if "Bill Not Found" in text or "does not belongs to IESCO" in text:
+        return None
+    if 'payable-card-amount' not in text and 'payable-card' not in text:
+        return None
+
+    amt_match = re.search(r'payable-card-amount">\s*([\d,]+)\s*</div>', text)
+    if not amt_match:
+        return None
+
+    result = {"amount": amt_match.group(1).replace(",", "")}
+    result["status"] = (
+        "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
+    )
+
+    month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
+    if month_match:
+        result["bill_month"] = normalize_iesco_month(month_match.group(1))
+
+    due_match = re.search(r'DUE DATE.*?right-main-val[^"]*">\s*([\d]{1,2}\s+[A-Z]{3}\s+\d{2})', text, re.DOTALL)
+    if due_match:
+        result["due_date"] = normalize_iesco_due_date(due_match.group(1))
+
+    name_match = re.search(r'NAME & ADDRESS.*?<span>([^<]+)</span>', text, re.DOTALL)
+    if name_match:
+        result["consumer_name"] = name_match.group(1).split(",")[0].strip()
+
+    charges_start = text.find("charges-breakdown-card")
+    if charges_start != -1:
+        charges_section = text[charges_start:charges_start + 6000]
+        items = re.findall(
+            r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
+            r'<span class="charges-bd-val[^"]*">(.*?)</span>',
+            charges_section, re.DOTALL,
+        )
+        parsed = {}
+        for label, value in items:
+            l = re.sub(r'<[^>]+>', '', label).strip()
+            v = re.sub(r'<[^>]+>', '', value).strip()
+            if l:
+                parsed[html.unescape(l)] = html.unescape(v)
+        if parsed:
+            result["breakup"] = parsed
+
+    # This hidden textarea is the detailed QR payload: energy charges,
+    # rates, taxes, FPA and sanctioned load.
+    charges_qr = re.search(
+        r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
+    )
+    if charges_qr:
+        result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
+        parsed = parse_charges_text(result["charges_text"])
+        if parsed:
+            result["calc"] = parsed
+
+    return result
+
 def _pitc_form_data(session):
     r = session.get("https://bill.pitc.com.pk/iescobill", timeout=PITC_TIMEOUT)
     data = {}
@@ -198,6 +257,100 @@ def _pitc_form_data(session):
     if not data:
         raise RuntimeError("PITC form did not render")
     return data
+
+def check_iesco_lumiproxy(ref, timeout=60):
+    """Fetch IESCO bill via LumiProxy web proxy using Playwright browser automation."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [LumiProxy] Playwright not installed")
+        return None
+
+    headless = _env_bool("HEADLESS", default=True)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context()
+            page = context.new_page()
+
+            page.goto("https://www.lumiproxy.com/online-proxy/proxysite/", timeout=timeout * 1000)
+            page.wait_for_timeout(1000)
+
+            # Accept terms/cookie banner if present
+            agree_btn = page.locator('button.el-button:has-text("Agree")')
+            if agree_btn.is_visible():
+                agree_btn.click()
+                page.wait_for_timeout(500)
+
+            # Select Pakistan as proxy location
+            select_box = page.locator('.el-select').first
+            select_box.click()
+            page.wait_for_timeout(500)
+
+            pak_opt = page.locator('.el-select-dropdown__item:has-text("Pakistan")').first
+            if pak_opt.is_visible():
+                pak_opt.click()
+                page.wait_for_timeout(500)
+
+            # Enter PITC website URL
+            url_input = page.locator('input[placeholder*="Enter web address"]')
+            url_input.fill("https://bill.pitc.com.pk/iescobill")
+
+            # Click GO button and wait for popup window
+            with page.expect_popup(timeout=timeout * 1000) as popup_info:
+                page.locator('.search_wrapper .btn').click()
+
+            popup = popup_info.value
+
+            # Wait for PITC iframe in popup window
+            frame = None
+            max_wait_frame = 30
+            for _ in range(max_wait_frame):
+                for f in popup.frames:
+                    if "iescobill" in f.url or "service" in f.url:
+                        frame = f
+                        break
+                if frame:
+                    break
+                page.wait_for_timeout(1000)
+
+            if not frame:
+                browser.close()
+                return None
+
+            # Fill reference number in searchTextBox inside iframe
+            ref_input = frame.locator('#searchTextBox, input[name="searchTextBox"]')
+            ref_input.wait_for(state="visible", timeout=timeout * 1000)
+
+            ref_input.fill(ref)
+
+            # Select refno radio option if present
+            rb = frame.locator('input[value="refno"], #rbSearchByList_0')
+            if rb.count() > 0:
+                rb.first.click()
+
+            # Submit search
+            search_btn = frame.locator('#btnSearch, input[name="btnSearch"]')
+            search_btn.click()
+
+            page.wait_for_timeout(5000)
+
+            # Wait for bill response elements or error text
+            for _ in range(20):
+                content = frame.content()
+                if ("payable-card-amount" in content or "payable-card" in content or
+                        "Bill Not Found" in content or "does not belongs to IESCO" in content):
+                    break
+                page.wait_for_timeout(1000)
+
+            html_text = frame.content()
+            browser.close()
+
+            return parse_iesco_official_html(html_text)
+    except Exception as e:
+        print(f"  [LumiProxy] Error: {e}")
+        return None
 
 def check_iesco_official(ref):
     return via_proxies(lambda session: _check_iesco_official(session, ref))
@@ -218,63 +371,12 @@ def _check_iesco_official(session, ref):
                 timeout=PITC_TIMEOUT,
             )
             text = r.text
-            if "Bill Not Found" in text:
-                return None
-            if 'payable-card-amount' not in text and 'payable-card' not in text:
-                if attempt < PITC_RETRIES:
-                    continue
-                return None
-
-            amt_match = re.search(r'payable-card-amount">\s*([\d,]+)\s*</div>', text)
-            if not amt_match:
-                return None
-
-            result = {"amount": amt_match.group(1).replace(",", "")}
-            result["status"] = (
-                "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
-            )
-
-            month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
-            if month_match:
-                result["bill_month"] = normalize_iesco_month(month_match.group(1))
-
-            due_match = re.search(r'DUE DATE.*?right-main-val[^"]*">\s*([\d]{1,2}\s+[A-Z]{3}\s+\d{2})', text, re.DOTALL)
-            if due_match:
-                result["due_date"] = normalize_iesco_due_date(due_match.group(1))
-
-            name_match = re.search(r'NAME & ADDRESS.*?<span>([^<]+)</span>', text, re.DOTALL)
-            if name_match:
-                result["consumer_name"] = name_match.group(1).split(",")[0].strip()
-
-            charges_start = text.find("charges-breakdown-card")
-            if charges_start != -1:
-                charges_section = text[charges_start:charges_start + 6000]
-                items = re.findall(
-                    r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
-                    r'<span class="charges-bd-val[^"]*">(.*?)</span>',
-                    charges_section, re.DOTALL,
-                )
-                parsed = {}
-                for label, value in items:
-                    l = re.sub(r'<[^>]+>', '', label).strip()
-                    v = re.sub(r'<[^>]+>', '', value).strip()
-                    if l:
-                        parsed[html.unescape(l)] = html.unescape(v)
-                if parsed:
-                    result["breakup"] = parsed
-
-            # This hidden textarea is the detailed QR payload: energy charges,
-            # rates, taxes, FPA and sanctioned load.
-            charges_qr = re.search(
-                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
-            )
-            if charges_qr:
-                result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
-                parsed = parse_charges_text(result["charges_text"])
-                if parsed:
-                    result["calc"] = parsed
-
-            return result
+            bill = parse_iesco_official_html(text)
+            if bill is not None:
+                return bill
+            if attempt < PITC_RETRIES and ("payable-card-amount" not in text and "payable-card" not in text):
+                continue
+            return None
         except Exception as e:
             last_exc = e
             if attempt < PITC_RETRIES:
@@ -285,6 +387,14 @@ def _check_iesco_official(session, ref):
     return None
 
 def check_iesco_bill(ref):
+    try:
+        bill = check_iesco_lumiproxy(ref)
+        if bill is not None:
+            bill["source"] = "lumiproxy"
+            return bill
+    except Exception as e:
+        print(f"  LumiProxy failed: {e}")
+
     try:
         bill = check_iesco_official(ref)
         if bill is not None:

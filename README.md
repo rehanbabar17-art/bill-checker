@@ -3,7 +3,7 @@
 Automated IESCO electricity bill checker with ntfy notifications.
 
 ## Features
-- Checks configured IESCO accounts
+- Checks configured IESCO accounts using primary LumiProxy web proxy browser automation with automatic fallbacks
 - Detects new bills, amount changes, and payment status changes
 - Sends ntfy notifications with consumer name, reference number, bill month, amount, due date, and paid/unpaid status
 - Extracts the detailed IESCO QR payload from the official PITC bill page
@@ -39,10 +39,21 @@ Standard `HTTPS_PROXY`/`HTTP_PROXY` are also honoured. Proxy credentials are
 masked in logs.
 
 ### Local run
-Create a local `config.json` (git-ignored) with the same structure, then:
+Install required dependencies (`requests`, `playwright` with Chromium browser):
+```bash
+pip install requests playwright
+playwright install chromium
 ```
+Create a local `config.json` (git-ignored) with the same structure, then:
+```bash
 python3 check_bills.py
 ```
+
+### IESCO Fetching Chain
+IESCO bills are fetched using a 3-tier fallback strategy:
+1. **Primary**: Browser automation via Playwright navigating through LumiProxy (Pakistan location).
+2. **Fallback 1**: Direct HTTP request to the official PITC bill site (`bill.pitc.com.pk`).
+3. **Fallback 2**: Third-party aggregator (`onlinebill.com.pk`).
 
 ## Manual Run
 Go to Actions → Check Utility Bills → Run workflow
