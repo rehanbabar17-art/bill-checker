@@ -489,9 +489,13 @@ def main():
 
     # Check SNGPL bills
     print("\n--- SNGPL Bills ---")
-    for account in config.get("sngpl", []):
-        name = account["name"]
-        consumer = account["consumer"]
+    for account in (config.get("sngpl") or []):
+        name = account.get("name", "SNGPL")
+        consumer = account.get("consumer") or account.get("ref", "")
+        if not consumer:
+            print(f"Checking {name}... Error: missing consumer/ref number")
+            errors.append(f"{name}: Missing consumer number")
+            continue
         print(f"Checking {name} ({consumer})...")
         try:
             bill = check_sngpl_bill(consumer)
@@ -574,7 +578,7 @@ def main():
                 print(f"\ntfy send failed")
 
     print(f"\n--- Summary ---")
-    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
+    print(f"IESCO: {len(config.get('iesco') or [])} | SNGPL: {len(config.get('sngpl') or [])}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)
