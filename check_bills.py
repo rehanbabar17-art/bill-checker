@@ -311,9 +311,57 @@ def check_iesco_bill(ref):
 
 def check_sngpl_bill(consumer):
     try:
-        return _check_sngpl_direct(consumer)
+        bill = _check_sngpl_direct(consumer)
+        if bill is not None:
+            return bill
+    except Exception:
+        pass
+
+    try:
+        return _check_sngpl_fallback(consumer)
     except Exception:
         return None
+
+def _check_sngpl_fallback(consumer):
+    url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
+    data = {"action": "gasbill_sngpl", "consumer": consumer}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
+    text = r.text
+    if "Unable to load" in text or "No bill found" in text or "Invalid request" in text:
+        return None
+
+    tds = re.findall(r'<td[^>]*>(.*?)</td>', text, re.DOTALL)
+    cleaned = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+    result = {}
+
+    for i, td in enumerate(cleaned):
+        if td == 'Name:' and i + 2 < len(cleaned):
+            result['consumer_name'] = cleaned[i + 2]
+            break
+
+    for i, td in enumerate(cleaned):
+        if re.match(r'^[A-Z][a-z]{2}\s+\d{4}$', td):
+            result['bill_month'] = td
+            break
+
+    amounts = [td for td in cleaned if re.match(r'^\d{1,3}(,\d{3})*$', td)]
+    if amounts:
+        result['amount'] = amounts[0]
+
+    for td in cleaned:
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', td):
+            result['due_date'] = td
+            break
+
+    if not result.get('amount'):
+        return None
+    return result
 
 def _check_sngpl_direct(consumer):
     urls = [
