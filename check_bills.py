@@ -5,7 +5,6 @@ import os
 import sys
 from datetime import datetime
 
-
 MONTH_NAMES = {
     "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
     "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
@@ -265,7 +264,101 @@ def check_iesco_official(ref):
         raise last_exc
     return None
 
+def check_iesco_playwright(ref):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            proxy_url = _get_proxy()
+            proxy_arg = {"server": proxy_url} if proxy_url else None
+            browser = p.chromium.launch(headless=True, proxy=proxy_arg)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+            page = context.new_page()
+            page.goto("https://bill.pitc.com.pk/iescobill", timeout=PITC_READ_TIMEOUT * 1000)
+            page.fill("input[name='searchTextBox'], #searchTextBox", ref)
+            page.click("input[name='btnSearch'], #btnSearch")
+            page.wait_for_selector(".payable-card-amount, .payable-card", timeout=15000)
+            text = page.content()
+            browser.close()
+
+            if "Bill Not Found" in text:
+                return None
+            if 'payable-card-amount' not in text and 'payable-card' not in text:
+                return None
+
+            amt_match = re.search(r'payable-card-amount">\s*([\d,]+)\s*</div>', text)
+            if not amt_match:
+                return None
+
+            result = {}
+            result["amount"] = amt_match.group(1).replace(",", "")
+            result["status"] = (
+                "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
+            )
+
+            month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
+            if month_match:
+                result["bill_month"] = normalize_iesco_month(month_match.group(1))
+
+            due_match = re.search(r'DUE DATE.*?right-main-val[^"]*">\s*([\d]{1,2}\s+[A-Z]{3}\s+\d{2})', text, re.DOTALL)
+            if due_match:
+                result["due_date"] = normalize_iesco_due_date(due_match.group(1))
+
+            name_match = re.search(r'NAME & ADDRESS.*?<span>([^<]+)</span>', text, re.DOTALL)
+            if name_match:
+                result["consumer_name"] = name_match.group(1).split(",")[0].strip()
+
+            charges_start = text.find('charges-breakdown-card')
+            if charges_start != -1:
+                charges_section = text[charges_start:charges_start + 6000]
+                items = re.findall(
+                    r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
+                    r'<span class="charges-bd-val[^"]*">(.*?)</span>',
+                    charges_section, re.DOTALL,
+                )
+                parsed = {}
+                for label, value in items:
+                    l = re.sub(r'<[^>]+>', '', label).strip()
+                    v = re.sub(r'<[^>]+>', '', value).strip()
+                    if l:
+                        parsed[l] = v
+                if parsed:
+                    result["breakup"] = parsed
+
+            charges_qr = re.search(
+                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>',
+                text, re.DOTALL,
+            )
+            if charges_qr:
+                result["charges_text"] = charges_qr.group(1).strip()
+                parsed = parse_charges_text(result["charges_text"])
+                if parsed:
+                    result["calc"] = parsed
+
+            result["source"] = "playwright"
+            return result
+    except Exception as e:
+        print(f"  Playwright error: {e}")
+        return None
+
 def check_iesco_bill(ref):
+    # Primary method: Playwright browser automation
+    try:
+        bill = check_iesco_playwright(ref)
+        if bill is not None:
+            return bill
+    except Exception:
+        pass
+
+    # Fallback 1: Official HTTP requests
     try:
         bill = check_iesco_official(ref)
         if bill is not None:
@@ -274,6 +367,7 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
+    # Fallback 2: onlinebill.com.pk
     r = requests.post(
         "https://onlinebill.com.pk/view-iesco-bill/",
         data={"reference": ref},
@@ -490,13 +584,9 @@ def main():
 
     # Check SNGPL bills
     print("\n--- SNGPL Bills ---")
-    for account in (config.get("sngpl") or []):
-        name = account.get("name", "SNGPL")
-        consumer = account.get("consumer") or account.get("ref", "")
-        if not consumer:
-            print(f"Checking {name}... Error: missing consumer/ref number")
-            errors.append(f"{name}: Missing consumer number")
-            continue
+    for account in config.get("sngpl", []):
+        name = account["name"]
+        consumer = account["consumer"]
         print(f"Checking {name} ({consumer})...")
         try:
             bill = check_sngpl_bill(consumer)
@@ -579,7 +669,7 @@ def main():
                 print(f"\ntfy send failed")
 
     print(f"\n--- Summary ---")
-    print(f"IESCO: {len(config.get('iesco') or [])} | SNGPL: {len(config.get('sngpl') or [])}")
+    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)
