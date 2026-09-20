@@ -33,20 +33,12 @@ def _env_bool(name, default=False):
         return default
     return val in ("1", "true", "yes", "on")
 
-# bill.pitc.com.pk is slow/flaky and often blackholed from cloud IPs. Use a
-# short connect timeout (so unreachable hosts fail fast) with a generous
-# read timeout (the site can take 15-40s to answer). Overridable via env so
-# a proxy run can tune it without code changes.
 PITC_CONNECT_TIMEOUT = _env_int("PITC_CONNECT_TIMEOUT", 10)
 PITC_READ_TIMEOUT = _env_int("PITC_READ_TIMEOUT", 45)
 PITC_RETRIES = _env_int("PITC_RETRIES", 2)
 PITC_TIMEOUT = (PITC_CONNECT_TIMEOUT, PITC_READ_TIMEOUT)
 
 def load_config():
-    # BILL_REFS env var (JSON) is the primary source on CI where the
-    # local config.json is not committed. Falls back to config.json for
-    # local runs. Format:
-    #   {"iesco":[{"name":"KhalaLower","ref":"..."}], "sngpl":[...]}
     env_refs = os.environ.get("BILL_REFS", "").strip()
     if env_refs:
         config = json.loads(env_refs)
@@ -67,7 +59,6 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 def normalize_iesco_month(value):
-    # "Aug 2026" or "AUG 26" -> "2026-08-01" to match stored state format
     value = value.strip()
     m = re.match(r"([A-Z][a-z]{2})\s+(\d{4})", value)
     if m and m.group(1) in MONTH_NAMES:
@@ -78,22 +69,16 @@ def normalize_iesco_month(value):
     return value
 
 def normalize_iesco_due_date(value):
-    # "31 AUG 26" -> "31 Aug 2026" to match stored state format
     m = re.match(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})$", value.strip())
     if m:
         return f"{m.group(1)} {m.group(2).title()} {2000 + int(m.group(3))}"
     return value
 
-
 def parse_charges_text(text):
-    """Parse the detailed charges_text from the PITC QR textarea into
-    a structured dict with energy details, taxes, FPA, and bill calc."""
     if not text:
         return None
-    # The QR textarea can contain HTML entities such as &amp; or &nbsp;.
     text = html.unescape(text).replace("\xa0", " ")
     result = {}
-    # ENERGY DETAILS
     energy = {}
     for key in ("UNITS", "VARIABLE CHRG", "FIXED CHRG", "METER RENT",
                 "SERVICE RENT", "F.C. SUR", "QTA"):
@@ -102,11 +87,9 @@ def parse_charges_text(text):
             energy[key.lower().replace(".", "").replace(" ", "_")] = m.group(1)
     if energy:
         result["energy"] = energy
-    # Per-unit rate from BILL CALC section (e.g. "33.1000 X 212")
     calc_lines = re.findall(r'([\d.]+)\s*X\s*(\d+)', text)
     if calc_lines:
         result["bill_calc"] = [f"{rate} × {units} units" for rate, units in calc_lines]
-    # TAXES
     taxes = {}
     for key in ("ED", "TV FEE", "GST", "ITAX"):
         m = re.search(rf'{key}\s*:\s*([-\d.]+)', text)
@@ -116,12 +99,10 @@ def parse_charges_text(text):
                 taxes[key] = m.group(1)
     if taxes:
         result["taxes"] = taxes
-    # FPA DETAILS
     fpa = {}
     m = re.search(r'FPA_ENERGY\s*:\s*([-\d.]+)', text)
     if m and float(m.group(1)) != 0:
         fpa["fpa_energy"] = m.group(1)
-    # FPA GST (second GST in the FPA section)
     fpa_section = re.search(r'FPA EN DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
     if not fpa_section:
         fpa_section = re.search(r'FPA DETAILS.*?GST\s*:\s*([-\d.]+)', text, re.DOTALL)
@@ -129,15 +110,12 @@ def parse_charges_text(text):
         fpa["fpa_gst"] = fpa_section.group(1)
     if fpa:
         result["fpa"] = fpa
-    # SAN LOAD
     m = re.search(r'SAN LOAD\s*:\s*([-\d.]+)', text)
     if m:
         result["san_load"] = m.group(1)
     return result if result else None
 
 def proxy_list():
-    """Proxy URLs from env, in priority order. PROXY_URL/PROXY_URLS may hold a
-    comma-separated list so several proxies can be tried in turn."""
     raw = []
     for var in ("PROXY_URLS", "PROXY_URL", "HTTPS_PROXY", "https_proxy",
                 "HTTP_PROXY", "http_proxy"):
@@ -164,7 +142,6 @@ def _mask_proxy(proxy):
 
 def new_session(proxy=None):
     session = requests.Session()
-    # Proxy selection is explicit, so ignore ambient *_proxy env vars.
     session.trust_env = False
     session.headers["User-Agent"] = USER_AGENT
     if proxy:
@@ -172,9 +149,6 @@ def new_session(proxy=None):
     return session
 
 def via_proxies(fetch):
-    """Call fetch(session) once per proxy candidate (proxies first, then a
-    direct connection) and return the first non-None result. The bill sites
-    routinely block datacenter/CI IP ranges, so a proxy is tried up front."""
     last_exc = None
     for proxy in _proxy_attempts():
         try:
@@ -263,8 +237,6 @@ def _check_iesco_official(session, ref):
                 if parsed:
                     result["breakup"] = parsed
 
-            # This hidden textarea is the detailed QR payload: energy charges,
-            # rates, taxes, FPA and sanctioned load.
             charges_qr = re.search(
                 r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>', text, re.DOTALL,
             )
@@ -284,7 +256,97 @@ def _check_iesco_official(session, ref):
         raise last_exc
     return None
 
+def check_iesco_playwright(ref):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            proxies = proxy_list()
+            proxy_url = proxies[0] if proxies else None
+            proxy_arg = {"server": proxy_url} if proxy_url else None
+            browser = p.chromium.launch(headless=True, proxy=proxy_arg)
+            context = browser.new_context(user_agent=USER_AGENT)
+            page = context.new_page()
+            page.goto("https://bill.pitc.com.pk/iescobill", timeout=PITC_READ_TIMEOUT * 1000)
+            page.fill("input[name='searchTextBox'], #searchTextBox", ref)
+            page.click("input[name='btnSearch'], #btnSearch")
+            page.wait_for_selector(".payable-card-amount, .payable-card", timeout=15000)
+            text = page.content()
+            browser.close()
+
+            if "Bill Not Found" in text:
+                return None
+            if 'payable-card-amount' not in text and 'payable-card' not in text:
+                return None
+
+            amt_match = re.search(r'payable-card-amount">\s*([\d,]+)\s*</div>', text)
+            if not amt_match:
+                return None
+
+            result = {}
+            result["amount"] = amt_match.group(1).replace(",", "")
+            result["status"] = (
+                "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
+            )
+
+            month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
+            if month_match:
+                result["bill_month"] = normalize_iesco_month(month_match.group(1))
+
+            due_match = re.search(r'DUE DATE.*?right-main-val[^"]*">\s*([\d]{1,2}\s+[A-Z]{3}\s+\d{2})', text, re.DOTALL)
+            if due_match:
+                result["due_date"] = normalize_iesco_due_date(due_match.group(1))
+
+            name_match = re.search(r'NAME & ADDRESS.*?<span>([^<]+)</span>', text, re.DOTALL)
+            if name_match:
+                result["consumer_name"] = name_match.group(1).split(",")[0].strip()
+
+            charges_start = text.find('charges-breakdown-card')
+            if charges_start != -1:
+                charges_section = text[charges_start:charges_start + 6000]
+                items = re.findall(
+                    r'<span class="charges-bd-en[^"]*">(.*?)</span>.*?'
+                    r'<span class="charges-bd-val[^"]*">(.*?)</span>',
+                    charges_section, re.DOTALL,
+                )
+                parsed = {}
+                for label, value in items:
+                    l = re.sub(r'<[^>]+>', '', label).strip()
+                    v = re.sub(r'<[^>]+>', '', value).strip()
+                    if l:
+                        parsed[html.unescape(l)] = html.unescape(v)
+                if parsed:
+                    result["breakup"] = parsed
+
+            charges_qr = re.search(
+                r'id="charges_qr_text_1"[^>]*>(.*?)</textarea>',
+                text, re.DOTALL,
+            )
+            if charges_qr:
+                result["charges_text"] = html.unescape(charges_qr.group(1)).strip()
+                parsed = parse_charges_text(result["charges_text"])
+                if parsed:
+                    result["calc"] = parsed
+
+            result["source"] = "playwright"
+            return result
+    except Exception as e:
+        print(f"  Playwright error: {e}")
+        return None
+
 def check_iesco_bill(ref):
+    # Primary method: Playwright browser automation
+    try:
+        bill = check_iesco_playwright(ref)
+        if bill is not None:
+            return bill
+    except Exception:
+        pass
+
+    # Fallback 1: Official HTTP requests via proxies
     try:
         bill = check_iesco_official(ref)
         if bill is not None:
@@ -293,13 +355,18 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
-    text = via_proxies(
-        lambda session: session.post(
-            "https://onlinebill.com.pk/view-iesco-bill/",
-            data={"reference": ref},
-            timeout=TIMEOUT,
-        ).text
-    )
+    # Fallback 2: onlinebill.com.pk via proxies
+    try:
+        text = via_proxies(
+            lambda session: session.post(
+                "https://onlinebill.com.pk/view-iesco-bill/",
+                data={"reference": ref},
+                timeout=TIMEOUT,
+            ).text
+        )
+    except Exception:
+        text = None
+
     if not text:
         return None
     result = {}
@@ -370,7 +437,6 @@ def _parse_sngpl_html(text):
             break
 
     if not result.get('amount'):
-        # Fallback regex parsing if table structure varies
         amt_match = re.search(r'(?:Payable|Amount)\s*[:\s]*Rs\.\s*([\d,]+)', text, re.IGNORECASE)
         if amt_match:
             result['amount'] = amt_match.group(1).replace(',', '')
@@ -467,9 +533,13 @@ def main():
     print()
 
     print("--- IESCO Bills ---")
-    for account in config["iesco"]:
-        name = account["name"]
-        ref = account["ref"]
+    for account in config.get("iesco") or []:
+        name = account.get("name", "IESCO")
+        ref = account.get("ref") or account.get("consumer", "")
+        if not ref:
+            print(f"Checking {name}... Error: missing reference number")
+            errors.append(f"{name}: Missing ref")
+            continue
         print(f"Checking {name} ({ref})...")
         try:
             bill = check_iesco_bill(ref)
@@ -491,8 +561,6 @@ def main():
             if not status_known:
                 bill["status"] = old_status
 
-            # Send a new notification when any important bill identity changes,
-            # including a corrected amount, not just month/status.
             if (new_month != old_month or new_amount != old_amount or
                     (status_known and new_status != old_status)):
                 print(f"  UPDATE: Rs. {bill['amount']} | {bill.get('bill_month', '')} | {bill.get('status', '')}")
@@ -507,9 +575,13 @@ def main():
             errors.append(f"{name}: {str(e)}")
 
     print("\n--- SNGPL Bills ---")
-    for account in config.get("sngpl", []):
-        name = account["name"]
-        consumer = account["consumer"]
+    for account in (config.get("sngpl") or []):
+        name = account.get("name", "SNGPL")
+        consumer = account.get("consumer") or account.get("ref", "")
+        if not consumer:
+            print(f"Checking {name}... Error: missing consumer/ref number")
+            errors.append(f"{name}: Missing consumer number")
+            continue
         print(f"Checking {name} ({consumer})...")
         try:
             bill = check_sngpl_bill(consumer)
@@ -593,7 +665,7 @@ def main():
                 print("\ntfy send failed")
 
     print("\n--- Summary ---")
-    print(f"IESCO: {len(config.get('iesco', []))} | SNGPL: {len(config.get('sngpl', []))}")
+    print(f"IESCO: {len(config.get('iesco') or [])} | SNGPL: {len(config.get('sngpl') or [])}")
     print(f"New: {len(changes)} | Errors: {len(errors)}")
 
     return len(changes)
