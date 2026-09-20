@@ -16,11 +16,22 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "bill_state.json")
 TIMEOUT = 15
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 def _env_int(name, default):
     try:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+def _env_bool(name, default=False):
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
 
 # bill.pitc.com.pk is slow/flaky and often blackholed from cloud IPs. Use a
 # short connect timeout (so unreachable hosts fail fast) with a generous
@@ -124,11 +135,57 @@ def parse_charges_text(text):
         result["san_load"] = m.group(1)
     return result if result else None
 
-def _get_proxy():
-    for var in ("PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        val = os.environ.get(var, "").strip()
-        if val:
-            return val
+def proxy_list():
+    """Proxy URLs from env, in priority order. PROXY_URL/PROXY_URLS may hold a
+    comma-separated list so several proxies can be tried in turn."""
+    raw = []
+    for var in ("PROXY_URLS", "PROXY_URL", "HTTPS_PROXY", "https_proxy",
+                "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            raw.extend(part.strip() for part in value.split(","))
+    proxies, seen = [], set()
+    for proxy in raw:
+        if proxy and proxy not in seen:
+            seen.add(proxy)
+            proxies.append(proxy)
+    return proxies
+
+def _proxy_attempts():
+    attempts = proxy_list()
+    if not (attempts and _env_bool("PROXY_ONLY")):
+        attempts.append(None)
+    return attempts
+
+def _mask_proxy(proxy):
+    if not proxy:
+        return "direct"
+    return re.sub(r"//[^@/]+@", "//***@", proxy)
+
+def new_session(proxy=None):
+    session = requests.Session()
+    # Proxy selection is explicit, so ignore ambient *_proxy env vars.
+    session.trust_env = False
+    session.headers["User-Agent"] = USER_AGENT
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    return session
+
+def via_proxies(fetch):
+    """Call fetch(session) once per proxy candidate (proxies first, then a
+    direct connection) and return the first non-None result. The bill sites
+    routinely block datacenter/CI IP ranges, so a proxy is tried up front."""
+    last_exc = None
+    for proxy in _proxy_attempts():
+        try:
+            result = fetch(new_session(proxy))
+            if result is not None:
+                return result
+        except Exception as e:
+            last_exc = e
+            print(f"  [{_mask_proxy(proxy)}] failed: {e}")
+    if last_exc is not None:
+        raise last_exc
     return None
 
 def _pitc_form_data(session):
@@ -143,17 +200,12 @@ def _pitc_form_data(session):
     return data
 
 def check_iesco_official(ref):
+    return via_proxies(lambda session: _check_iesco_official(session, ref))
+
+def _check_iesco_official(session, ref):
     last_exc = None
     for attempt in range(1, PITC_RETRIES + 1):
         try:
-            session = requests.Session()
-            session.headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            proxy = _get_proxy()
-            if proxy:
-                session.proxies = {"http": proxy, "https": proxy}
             data = _pitc_form_data(session)
             data["rbSearchByList"] = "refno"
             data["searchTextBox"] = ref
@@ -241,12 +293,15 @@ def check_iesco_bill(ref):
     except Exception:
         pass
 
-    r = requests.post(
-        "https://onlinebill.com.pk/view-iesco-bill/",
-        data={"reference": ref},
-        timeout=TIMEOUT,
+    text = via_proxies(
+        lambda session: session.post(
+            "https://onlinebill.com.pk/view-iesco-bill/",
+            data={"reference": ref},
+            timeout=TIMEOUT,
+        ).text
     )
-    text = r.text
+    if not text:
+        return None
     result = {}
 
     amt_match = re.search(r"Payable within due date.*?Rs\.\s*([\d,]+)", text, re.DOTALL)
@@ -334,32 +389,24 @@ def _check_sngpl_sngpl_bill_pk(consumer):
     url = "https://sngpl-bill.pk/wp-admin/admin-ajax.php"
     data = {"action": "gasbill_sngpl", "consumer": consumer}
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
         "Referer": "https://sngpl-bill.pk/",
-        "X-Requested-With": "XMLHttpRequest"
+        "X-Requested-With": "XMLHttpRequest",
     }
-    proxy = _get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    r = requests.post(url, data=data, headers=headers, proxies=proxies, timeout=TIMEOUT)
-    return _parse_sngpl_html(r.text)
+    return via_proxies(
+        lambda session: _parse_sngpl_html(
+            session.post(url, data=data, headers=headers, timeout=TIMEOUT).text
+        )
+    )
 
 def _check_sngpl_onlinebill(consumer):
     url = "https://onlinebill.com.pk/sngpl-bill/"
     data = {"reference": consumer, "type": "sngpl"}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://onlinebill.com.pk/sngpl-bill/"
-    }
-    proxy = _get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    r = requests.post(url, data=data, headers=headers, proxies=proxies, timeout=TIMEOUT)
-    return _parse_sngpl_html(r.text)
+    headers = {"Referer": "https://onlinebill.com.pk/sngpl-bill/"}
+    return via_proxies(
+        lambda session: _parse_sngpl_html(
+            session.post(url, data=data, headers=headers, timeout=TIMEOUT).text
+        )
+    )
 
 def _check_sngpl_direct(consumer):
     urls = [
@@ -376,25 +423,19 @@ def _check_sngpl_direct(consumer):
             f"&artcl=artuyh709123465"
         )
     ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    proxy = _get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, proxies=proxies, timeout=TIMEOUT)
-            parsed = _parse_sngpl_html(r.text)
-            if parsed and parsed.get("amount"):
-                return parsed
-        except Exception:
-            continue
+    def fetch(session):
+        for url in urls:
+            try:
+                r = session.get(url, timeout=TIMEOUT)
+                parsed = _parse_sngpl_html(r.text)
+                if parsed and parsed.get("amount"):
+                    return parsed
+            except Exception:
+                continue
+        return None
 
-    return None
+    return via_proxies(fetch)
 
 def send_ntfy(ntfy_key, title, message):
     url = f"https://ntfy.sh/{ntfy_key}"
@@ -416,7 +457,14 @@ def main():
     changes = []
     errors = []
 
-    print(f"=== Bill Check: {datetime.now().strftime('%Y-%m-%d %H:%M')} ===\n")
+    print(f"=== Bill Check: {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    proxies = proxy_list()
+    if proxies:
+        print("Proxies: " + ", ".join(_mask_proxy(p) for p in proxies)
+              + (" (proxy only)" if _env_bool("PROXY_ONLY") else " then direct"))
+    else:
+        print("Proxies: none configured (direct connections)")
+    print()
 
     print("--- IESCO Bills ---")
     for account in config["iesco"]:
