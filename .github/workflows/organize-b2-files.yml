@@ -1,0 +1,33 @@
+name: Organize Bill Checker B2 Files
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Move bill-checker files into bill-checker/
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: npm run b2:move-root-to-folder
+      - name: Verify bill-checker folder
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: npm run b2:verify

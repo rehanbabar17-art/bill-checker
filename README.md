@@ -4,11 +4,11 @@ Automated IESCO and SNGPL bill checker with ntfy notifications.
 
 ## Private storage migration
 
-Backblaze B2 is now the active production storage. Mega remains configured as a rollback and migration source until B2 has completed several scheduled cycles. The B2 bucket is private and contains:
+Backblaze B2 is now the active production storage. Mega remains configured as a rollback and migration source until B2 has completed several scheduled cycles. The shared B2 bucket uses the dedicated `bill-checker/` folder for this repository:
 
-- `config.json` — IESCO/SNGPL configuration
-- `bill_state.json` — bill history/state
-- `REFERENCE_NUMBERS.txt` — labeled private guide
+- `bill-checker/config.json` — IESCO/SNGPL configuration
+- `bill-checker/bill_state.json` — bill history/state
+- `bill-checker/REFERENCE_NUMBERS.txt` — labeled private guide
 
 The checker reports an explicit **PAID** or **UNPAID** status for each IESCO bill and includes that status in ntfy notifications. If the bill page does not show a paid marker, a bill with payable data is reported as **UNPAID**.
 
@@ -34,6 +34,8 @@ The B2 key must have read/write access to the bucket. Keep the old Mega secrets 
 5. The migration reads `config.json` and the labeled guide from Mega. It does not require `bill_state.json` from Mega; existing B2 state is preserved, otherwise an empty B2 state object is initialized.
 6. After verification, switch the hourly workflow to `b2:download` and `b2:upload`.
 7. Keep Mega as rollback for several successful scheduled runs before removing it.
+
+For the existing installation, run **Actions → Organize Bill Checker B2 Files** once. It copies the verified root objects into `bill-checker/`, verifies them, and then removes the old root copies. Parcel-tracker uses its separate `parcel-tracker/` folder.
 
 ## Resetting bill history
 

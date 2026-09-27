@@ -18,6 +18,7 @@
     "b2:upload": "node b2_sync.mjs upload",
     "b2:migrate-from-mega": "node b2_sync.mjs migrate-from-mega",
     "b2:reset-state": "node b2_sync.mjs reset-state",
+    "b2:move-root-to-folder": "node b2_sync.mjs move-root-to-folder",
     "b2:verify": "node b2_sync.mjs verify"
   },
   "dependencies": {

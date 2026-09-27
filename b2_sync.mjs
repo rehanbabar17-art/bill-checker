@@ -2,14 +2,18 @@ import { Storage } from 'megajs';
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
 const ROOT_DIR = process.cwd();
 const CONFIG_FILE = path.join(ROOT_DIR, 'config.json');
 const STATE_FILE = path.join(ROOT_DIR, 'bill_state.json');
-const CONFIG_KEY = 'config.json';
-const STATE_KEY = 'bill_state.json';
-const GUIDE_KEY = 'REFERENCE_NUMBERS.txt';
+const B2_PREFIX = 'bill-checker/';
+const CONFIG_KEY = `${B2_PREFIX}config.json`;
+const STATE_KEY = `${B2_PREFIX}bill_state.json`;
+const GUIDE_KEY = `${B2_PREFIX}REFERENCE_NUMBERS.txt`;
+const LEGACY_CONFIG_KEY = 'config.json';
+const LEGACY_STATE_KEY = 'bill_state.json';
+const LEGACY_GUIDE_KEY = 'REFERENCE_NUMBERS.txt';
 const B2_TIMEOUT_MS = 20_000;
 const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASSWORD = process.env.MEGA_PASSWORD;
@@ -105,6 +109,15 @@ async function b2Put(client, bucket, key, body) {
   } catch (error) {
     if (error instanceof SyncFailure) throw error;
     throw new SyncFailure(`Could not write B2 object ${key}.`);
+  }
+}
+
+async function b2Delete(client, bucket, key) {
+  try {
+    await withTimeout(client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })), `delete ${key}`);
+  } catch (error) {
+    if (error instanceof SyncFailure) throw error;
+    throw new SyncFailure(`Could not delete legacy B2 object ${key}.`);
   }
 }
 
@@ -232,13 +245,40 @@ async function resetB2State() {
   }
 }
 
+async function moveLegacyRootToFolder() {
+  try {
+    const { bucket, client } = b2Client();
+    const configData = await b2Get(client, bucket, LEGACY_CONFIG_KEY, true);
+    const stateData = await b2Get(client, bucket, LEGACY_STATE_KEY, true);
+    const guideData = await b2Get(client, bucket, LEGACY_GUIDE_KEY);
+    const config = parseConfig(configData);
+    parseState(stateData);
+    await b2Put(client, bucket, CONFIG_KEY, configData);
+    await b2Put(client, bucket, STATE_KEY, stateData);
+    await b2Put(client, bucket, GUIDE_KEY, guideData || Buffer.from(referenceGuide(config), 'utf8'));
+    const verified = await readB2();
+    if (Object.keys(verified.state).length !== Object.keys(parseState(stateData)).length) {
+      throw new SyncFailure('B2 folder verification did not match the legacy state.');
+    }
+    await b2Delete(client, bucket, LEGACY_CONFIG_KEY);
+    await b2Delete(client, bucket, LEGACY_STATE_KEY);
+    if (guideData) await b2Delete(client, bucket, LEGACY_GUIDE_KEY);
+    console.log(`[B2] Moved bill-checker data into ${B2_PREFIX} and removed legacy root objects after verification.`);
+    return true;
+  } catch (error) {
+    console.error(`[B2] Folder migration failed: ${error instanceof SyncFailure ? error.message : 'B2 authentication, storage, or network error.'}`);
+    return false;
+  }
+}
+
 const command = process.argv[2];
 const task = command === 'download' ? downloadFromB2()
   : command === 'upload' ? uploadToB2()
       : command === 'migrate-from-mega' ? migrateFromMega()
       : command === 'reset-state' ? resetB2State()
-        : command === 'verify' ? verifyB2()
-          : Promise.reject(new Error('Usage: node b2_sync.mjs <download|upload|migrate-from-mega|reset-state|verify>'));
+        : command === 'move-root-to-folder' ? moveLegacyRootToFolder()
+          : command === 'verify' ? verifyB2()
+            : Promise.reject(new Error('Usage: node b2_sync.mjs <download|upload|migrate-from-mega|reset-state|move-root-to-folder|verify>'));
 
 task.then((ok) => { if (!ok) process.exitCode = 1; }).catch((error) => {
   console.error(`[B2] ${error.message}`);
