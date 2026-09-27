@@ -10,6 +10,8 @@ Backblaze B2 is now the active production storage. Mega remains configured as a 
 - `bill_state.json` — bill history/state
 - `REFERENCE_NUMBERS.txt` — labeled private guide
 
+The checker reports an explicit **PAID** or **UNPAID** status for each IESCO bill and includes that status in ntfy notifications. If the bill page does not show a paid marker, a bill with payable data is reported as **UNPAID**.
+
 ## Backblaze B2 secrets
 
 Add these encrypted GitHub Actions secrets to `rehanbabar17-art/bill-checker`:
@@ -32,3 +34,7 @@ The B2 key must have read/write access to the bucket. Keep the old Mega secrets 
 5. The migration reads `config.json` and the labeled guide from Mega. It does not require `bill_state.json` from Mega; existing B2 state is preserved, otherwise an empty B2 state object is initialized.
 6. After verification, switch the hourly workflow to `b2:download` and `b2:upload`.
 7. Keep Mega as rollback for several successful scheduled runs before removing it.
+
+## Resetting bill history
+
+Run **Actions → Reset B2 Bill History** to replace only `bill_state.json` with an empty object. It preserves the IESCO/SNGPL configuration and reference guide. The next bill-check run treats all fetched bills as new and sends a fresh ntfy notification for each detected bill.

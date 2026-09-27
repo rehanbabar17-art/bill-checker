@@ -218,12 +218,27 @@ async function verifyB2() {
   }
 }
 
+async function resetB2State() {
+  try {
+    const { bucket, client } = b2Client();
+    const configData = await b2Get(client, bucket, CONFIG_KEY, true);
+    parseConfig(configData);
+    await b2Put(client, bucket, STATE_KEY, Buffer.from('{}\n', 'utf8'));
+    console.log('[B2] Cleared bill_state.json; configuration and reference guide were not changed.');
+    return true;
+  } catch (error) {
+    console.error(`[B2] State reset failed: ${error instanceof SyncFailure ? error.message : 'B2 authentication, storage, or network error.'}`);
+    return false;
+  }
+}
+
 const command = process.argv[2];
 const task = command === 'download' ? downloadFromB2()
   : command === 'upload' ? uploadToB2()
-    : command === 'migrate-from-mega' ? migrateFromMega()
-      : command === 'verify' ? verifyB2()
-        : Promise.reject(new Error('Usage: node b2_sync.mjs <download|upload|migrate-from-mega|verify>'));
+      : command === 'migrate-from-mega' ? migrateFromMega()
+      : command === 'reset-state' ? resetB2State()
+        : command === 'verify' ? verifyB2()
+          : Promise.reject(new Error('Usage: node b2_sync.mjs <download|upload|migrate-from-mega|reset-state|verify>'));
 
 task.then((ok) => { if (!ok) process.exitCode = 1; }).catch((error) => {
   console.error(`[B2] ${error.message}`);

@@ -74,6 +74,14 @@ def normalize_iesco_due_date(value):
         return f"{m.group(1)} {m.group(2).title()} {2000 + int(m.group(3))}"
     return value
 
+def extract_iesco_status(text):
+    normalized = re.sub(r"\s+", " ", html.unescape(text or "")).lower()
+    if "full_bill_paid.png" in normalized or "payable-card-paid" in normalized:
+        return "PAID"
+    if re.search(r"\bamount paid\b|\bbill paid\b|\bpaid in full\b", normalized):
+        return "PAID"
+    return "UNPAID"
+
 def parse_charges_text(text):
     if not text:
         return None
@@ -204,9 +212,7 @@ def _check_iesco_official(session, ref):
                 return None
 
             result = {"amount": amt_match.group(1).replace(",", "")}
-            result["status"] = (
-                "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
-            )
+            result["status"] = extract_iesco_status(text)
 
             month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
             if month_match:
@@ -288,9 +294,7 @@ def check_iesco_playwright(ref):
 
             result = {}
             result["amount"] = amt_match.group(1).replace(",", "")
-            result["status"] = (
-                "PAID" if '<div class="payable-card-paid">' in text and "full_bill_paid.png" in text else "UNPAID"
-            )
+            result["status"] = extract_iesco_status(text)
 
             month_match = re.search(r'BILL MONTH.*?right-main-val">\s*([A-Z]{3}\s+\d{2})', text, re.DOTALL)
             if month_match:
@@ -387,8 +391,7 @@ def check_iesco_bill(ref):
     if due_match:
         result["due_date"] = due_match.group(1)
 
-    if re.search(r">\s*Amount paid\s*<", text):
-        result["status"] = "PAID"
+    result["status"] = extract_iesco_status(text)
 
     if not result.get("amount"):
         return None
