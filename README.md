@@ -4,7 +4,7 @@ Automated IESCO and SNGPL bill checker with ntfy notifications.
 
 ## Private storage migration
 
-The current production workflow remains on Mega while Backblaze B2 is staged and verified. The B2 bucket is private and will contain:
+Backblaze B2 is now the active production storage. Mega remains configured as a rollback and migration source until B2 has completed several scheduled cycles. The B2 bucket is private and contains:
 
 - `config.json` — IESCO/SNGPL configuration
 - `bill_state.json` — bill history/state
