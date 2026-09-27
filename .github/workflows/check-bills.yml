@@ -22,27 +22,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          cache: npm
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Mega dependencies
+      - name: Install B2 dependencies
         run: npm ci
 
       - name: Install bill-checker dependencies
         run: pip install 'requests[socks]'
 
-      # BILL_REFS is retained only as a one-time migration fallback. After the
-      # first successful upload, config.json in Mega is the source of truth.
-      - name: Download private bill data from Mega
-        id: mega_download
+      - name: Download private bill data from B2
+        id: b2_download
         env:
-          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-          BILL_REFS: ${{ secrets.BILL_REFS }}
-        run: npm run mega:download
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: npm run b2:download
 
       - name: Check bills
         id: check_bills
@@ -53,12 +52,14 @@ jobs:
           PROXY_ONLY: ${{ vars.PROXY_ONLY }}
         run: python check_bills.py
 
-      - name: Upload updated private bill data to Mega
-        if: ${{ always() && steps.mega_download.outcome == 'success' && steps.check_bills.outcome == 'success' }}
+      - name: Upload updated private bill data to B2
+        if: ${{ always() && steps.b2_download.outcome == 'success' && steps.check_bills.outcome == 'success' }}
         env:
-          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-        run: npm run mega:upload
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: npm run b2:upload
 
       - name: Secure cleanup of local private data
         if: always()
