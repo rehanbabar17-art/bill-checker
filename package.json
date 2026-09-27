@@ -12,6 +12,7 @@
     "firebase:download": "node firebase_sync.mjs download",
     "firebase:upload": "node firebase_sync.mjs upload",
     "firebase:migrate-from-mega": "node firebase_sync.mjs migrate-from-mega",
+    "firebase:initialize-state": "node firebase_sync.mjs initialize-state",
     "firebase:verify": "node firebase_sync.mjs verify"
   },
   "dependencies": {

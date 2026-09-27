@@ -192,23 +192,23 @@ async function uploadToFirebase() {
 async function migrateFromMega() {
   let storage;
   try {
-    console.log('[FIREBASE] Reading config, bill state, and reference guide from Mega.');
+    console.log('[FIREBASE] Reading config and reference guide from Mega; bill history will be initialized/preserved in Firebase.');
     const mega = await openMega();
     storage = mega.storage;
     const configData = await megaFile(mega.folder, 'config.json');
-    const stateData = await megaFile(mega.folder, 'bill_state.json');
     const guideData = await megaFile(mega.folder, 'REFERENCE_NUMBERS.txt');
     if (!configData) throw new SyncFailure('MEGA config.json is missing.');
-    if (!stateData) throw new SyncFailure('MEGA bill_state.json is missing.');
     const config = parseConfig(configData);
-    const state = parseState(stateData);
     const guide = guideData?.toString('utf8') || referenceGuide(config);
-    console.log(`[FIREBASE] Mega read succeeded: ${(config.iesco ?? []).length} IESCO, ${(config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(state).length} bill-state records.`);
+    console.log(`[FIREBASE] Mega read succeeded: ${(config.iesco ?? []).length} IESCO and ${(config.sngpl ?? []).length} SNGPL accounts.`);
     console.log('[FIREBASE] Connecting to Firebase and writing the staged copy.');
     const db = firebaseDatabase();
-    await db.ref(FIREBASE_ROOT).set({ config, state, 'reference-guide': guide });
+    const existing = await db.ref(FIREBASE_ROOT).once('value');
+    const existingValue = existing.val();
+    const state = isRecord(existingValue?.state) ? existingValue.state : {};
+    await db.ref(FIREBASE_ROOT).update({ config, state, 'reference-guide': guide });
     const verified = await readFirebase();
-    console.log(`[FIREBASE] Migration complete and verified: ${(verified.config.iesco ?? []).length} IESCO, ${(verified.config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(verified.state).length} bill-state records.`);
+    console.log(`[FIREBASE] Migration complete and verified: ${(verified.config.iesco ?? []).length} IESCO, ${(verified.config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(verified.state).length} Firebase bill-state records.`);
     return true;
   } catch (error) {
     console.error(`[FIREBASE] Migration failed: ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
@@ -231,12 +231,36 @@ async function verifyFirebase() {
   }
 }
 
+async function initializeFirebaseState() {
+  try {
+    const db = firebaseDatabase();
+    const existing = await db.ref(FIREBASE_ROOT).once('value');
+    const value = existing.val();
+    if (!isRecord(value?.config)) throw new SyncFailure('Firebase bill-checker/config must exist before initializing state.');
+    if (isRecord(value.state)) {
+      parseState(JSON.stringify(value.state));
+      console.log(`[FIREBASE] Existing bill history preserved (${Object.keys(value.state).length} records).`);
+      return true;
+    }
+    await db.ref(`${FIREBASE_ROOT}/state`).set({});
+    await db.ref(`${FIREBASE_ROOT}/reference-guide`).set(typeof value['reference-guide'] === 'string'
+      ? value['reference-guide']
+      : referenceGuide(value.config));
+    console.log('[FIREBASE] Initialized bill-checker/state directly in Firebase as an empty history object.');
+    return true;
+  } catch (error) {
+    console.error(`[FIREBASE] State initialization failed: ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
+    return false;
+  }
+}
+
 const command = process.argv[2];
 const task = command === 'download' ? downloadFromFirebase()
   : command === 'upload' ? uploadToFirebase()
     : command === 'migrate-from-mega' ? migrateFromMega()
-      : command === 'verify' ? verifyFirebase()
-        : Promise.reject(new Error('Usage: node firebase_sync.mjs <download|upload|migrate-from-mega|verify>'));
+      : command === 'initialize-state' ? initializeFirebaseState()
+        : command === 'verify' ? verifyFirebase()
+          : Promise.reject(new Error('Usage: node firebase_sync.mjs <download|upload|migrate-from-mega|initialize-state|verify>'));
 
 task.then((ok) => { if (!ok) process.exitCode = 1; }).catch((error) => {
   console.error(`[FIREBASE] ${error.message}`);
