@@ -17,6 +17,7 @@ class SyncFailure extends Error {}
 function safeFailureCategory(error) {
   const code = typeof error?.code === 'string' ? error.code : '';
   const message = error instanceof Error ? error.message : String(error ?? '');
+  if (code) return `External service returned safe error code ${code}.`;
   if (message.includes('FIREBASE_SERVICE_ACCOUNT')) return 'Firebase service-account secret is missing, invalid JSON, or missing required fields.';
   if (code === 'PERMISSION_DENIED' || /permission[_ ]denied|PERMISSION_DENIED/i.test(message)) return 'Firebase database permission was denied; check Realtime Database rules and service-account access.';
   if (code === 'INVALID_ARGUMENT' || /invalid argument|invalid database/i.test(message)) return 'Firebase rejected the database URL or request configuration.';
@@ -179,6 +180,7 @@ async function uploadToFirebase() {
 async function migrateFromMega() {
   let storage;
   try {
+    console.log('[FIREBASE] Reading config, bill state, and reference guide from Mega.');
     const mega = await openMega();
     storage = mega.storage;
     const configData = await megaFile(mega.folder, 'config.json');
@@ -189,6 +191,8 @@ async function migrateFromMega() {
     const config = parseConfig(configData);
     const state = parseState(stateData);
     const guide = guideData?.toString('utf8') || referenceGuide(config);
+    console.log(`[FIREBASE] Mega read succeeded: ${(config.iesco ?? []).length} IESCO, ${(config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(state).length} bill-state records.`);
+    console.log('[FIREBASE] Connecting to Firebase and writing the staged copy.');
     const db = firebaseDatabase();
     await db.ref(FIREBASE_ROOT).set({ config, state, 'reference-guide': guide });
     const verified = await readFirebase();
