@@ -2,36 +2,33 @@
 
 Automated IESCO and SNGPL bill checker with ntfy notifications.
 
-## Private data storage
+## Private storage migration
 
-The active storage is being migrated from Mega to Firebase Realtime Database. During migration, Mega remains available as a rollback source.
+The current production workflow remains on Mega while Backblaze B2 is staged and verified. The B2 bucket is private and will contain:
 
-Firebase path: `bill-checker`
+- `config.json` — IESCO/SNGPL configuration
+- `bill_state.json` — bill history/state
+- `REFERENCE_NUMBERS.txt` — labeled private guide
 
-- `config` — machine-readable configuration with separate `iesco` and `sngpl` arrays.
-- `state` — private bill history.
-- `reference-guide` — labeled IESCO/SNGPL reference guide.
+## Backblaze B2 secrets
 
-The legacy Mega folder is `github-data/bill-checker` and contains the equivalent private files.
+Add these encrypted GitHub Actions secrets to `rehanbabar17-art/bill-checker`:
 
-## GitHub Secrets
-| Secret | Purpose |
+| Secret | Value |
 |---|---|
-| `FIREBASE_SERVICE_ACCOUNT` | Firebase Admin SDK service-account JSON |
-| `FIREBASE_DATABASE_URL` | Firebase Realtime Database URL |
-| `MEGA_EMAIL` | Temporary rollback/migration source |
-| `MEGA_PASSWORD` | Temporary rollback/migration source |
-| `BILL_REFS` | Legacy configuration migration/bootstrap |
-| `SNGPL_REFS` | SNGPL reference migration input |
-| `NTFY_KEY` | ntfy topic/key for notifications |
-| `PROXY_URL` | Proxy, or comma-separated proxy list, for bill-site requests |
+| `B2_KEY_ID` | Replacement B2 key ID |
+| `B2_APPLICATION_KEY` | Replacement B2 application key |
+| `B2_BUCKET` | `GithubRepoSecretRB17` |
+| `B2_ENDPOINT` | `https://s3.us-east-005.backblazeb2.com` |
 
-## Migration
+The B2 key must have read/write access to the bucket. Keep the old Mega secrets until B2 passes migration, verification, and a full bill-check cycle. Revoke any previously exposed Backblaze application key.
 
-1. Run **Actions → Migrate Bill Data from Mega to Firebase**.
-2. Confirm the workflow verifies the Firebase data.
-3. Switch the regular **Check Utility Bills** workflow to Firebase.
-4. Keep Mega secrets and files until Firebase has passed several scheduled runs.
-5. Remove Mega only after rollback is no longer needed.
+## Migration steps
 
-The migration copies the existing IESCO/SNGPL configuration, bill history, and labeled reference guide without changing the Mega source.
+1. Create a replacement B2 application key and revoke the exposed old key.
+2. Add the four B2 secrets above.
+3. Run **Actions → Verify Backblaze B2 Storage** to test access.
+4. Run **Actions → Migrate Bill Data from Mega to Backblaze B2**.
+5. The migration reads `config.json` and the labeled guide from Mega. It does not require `bill_state.json` from Mega; existing B2 state is preserved, otherwise an empty B2 state object is initialized.
+6. After verification, switch the hourly workflow to `b2:download` and `b2:upload`.
+7. Keep Mega as rollback for several successful scheduled runs before removing it.
