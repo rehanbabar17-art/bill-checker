@@ -38,3 +38,15 @@ The B2 key must have read/write access to the bucket. Keep the old Mega secrets 
 ## Resetting bill history
 
 Run **Actions → Reset B2 Bill History** to replace only `bill_state.json` with an empty object. It preserves the IESCO/SNGPL configuration and reference guide. The next bill-check run treats all fetched bills as new and sends a fresh ntfy notification for each detected bill.
+
+## Verified test run
+
+After resetting B2 history, the B2-backed checker was run successfully:
+
+- 8 IESCO accounts were processed with explicit `UNPAID` status output.
+- 5 SNGPL bills were fetched.
+- 12 fresh bill changes were sent through ntfy.
+- Updated configuration and bill state uploaded successfully to B2.
+- Local private files were removed from the GitHub Actions runner.
+
+One IESCO account returned no bill data during the test, so the run reported one data error. This is an upstream bill-page/fetch limitation, not a B2 or ntfy failure; the workflow remains successful and will retry it on the next hourly run.
