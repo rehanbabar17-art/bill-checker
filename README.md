@@ -4,7 +4,7 @@ Automated IESCO and SNGPL bill checker with ntfy notifications.
 
 ## Private storage migration
 
-Backblaze B2 is now the active production storage. Mega remains configured as a rollback and migration source until B2 has completed several scheduled cycles. The shared B2 bucket uses the dedicated `bill-checker/` folder for this repository:
+Backblaze B2 is the active production storage. The shared B2 bucket uses the dedicated `bill-checker/` folder for this repository:
 
 - `bill-checker/config.json` — IESCO/SNGPL configuration
 - `bill-checker/bill_state.json` — bill history/state
@@ -23,19 +23,11 @@ Add these encrypted GitHub Actions secrets to `rehanbabar17-art/bill-checker`:
 | `B2_BUCKET` | `GithubRepoSecretRB17` |
 | `B2_ENDPOINT` | `https://s3.us-east-005.backblazeb2.com` |
 
-The B2 key must have read/write access to the bucket. Keep the old Mega secrets until B2 passes migration, verification, and a full bill-check cycle. Revoke any previously exposed Backblaze application key.
+The B2 key must have read/write access to the bucket. Revoke any previously exposed Backblaze application key.
 
-## Migration steps
+## Storage setup
 
-1. Create a replacement B2 application key and revoke the exposed old key.
-2. Add the four B2 secrets above.
-3. Run **Actions → Verify Backblaze B2 Storage** to test access.
-4. Run **Actions → Migrate Bill Data from Mega to Backblaze B2**.
-5. The migration reads `config.json` and the labeled guide from Mega. It does not require `bill_state.json` from Mega; existing B2 state is preserved, otherwise an empty B2 state object is initialized.
-6. After verification, switch the hourly workflow to `b2:download` and `b2:upload`.
-7. Keep Mega as rollback for several successful scheduled runs before removing it.
-
-For the existing installation, run **Actions → Organize Bill Checker B2 Files** once. It copies the verified root objects into `bill-checker/`, verifies them, and then removes the old root copies. Parcel-tracker uses its separate `parcel-tracker/` folder.
+The B2 folder organization has been completed. Run **Actions → Verify Backblaze B2 Storage** to confirm access and object validity. The production hourly workflow reads and writes only the `bill-checker/` objects.
 
 ## Resetting bill history
 
