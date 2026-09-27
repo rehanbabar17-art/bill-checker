@@ -108,6 +108,15 @@ function legacyConfig() {
   return parseConfig(raw);
 }
 
+function sngplConfig() {
+  const raw = process.env.SNGPL_REFS?.trim();
+  if (!raw) return undefined;
+  const value = parseJson(raw, 'SNGPL_REFS');
+  const accounts = Array.isArray(value) ? value : value.sngpl;
+  if (!Array.isArray(accounts)) throw new SyncFailure('SNGPL_REFS must contain an array of SNGPL accounts.');
+  return { sngpl: accounts };
+}
+
 function normalizeConfig(config) {
   const normalized = {
     iesco: Array.isArray(config.iesco) ? config.iesco : [],
@@ -246,8 +255,11 @@ async function initializeMega() {
 async function migrateMega() {
   let storage;
   try {
-    const incoming = legacyConfig();
-    if (!incoming) throw new SyncFailure('BILL_REFS is required to migrate IESCO/SNGPL references.');
+    const incoming = legacyConfig() ?? {};
+    const suppliedSngpl = sngplConfig() ?? {};
+    if (!Object.keys(incoming).length && !Object.keys(suppliedSngpl).length) {
+      throw new SyncFailure('BILL_REFS or SNGPL_REFS is required to migrate IESCO/SNGPL references.');
+    }
     storage = await openStorage();
     const folder = await getBillFolder(storage, false);
     if (!folder) throw new SyncFailure('The private MEGA folder github-data/bill-checker was not found.');
@@ -256,12 +268,13 @@ async function migrateMega() {
     const merged = normalizeConfig(remoteConfig);
     merged.iesco = mergeAccounts(merged.iesco, incoming.iesco, 'iesco');
     merged.sngpl = mergeAccounts(merged.sngpl, incoming.sngpl, 'sngpl');
+    merged.sngpl = mergeAccounts(merged.sngpl, suppliedSngpl.sngpl, 'sngpl');
     if (typeof incoming.ntfy_key === 'string' && !merged.ntfy_key) merged.ntfy_key = incoming.ntfy_key;
     const configData = Buffer.from(JSON.stringify(merged, null, 2) + '\n', 'utf8');
     await uploadRemoteFile(folder, 'config.json', configData);
     await uploadRemoteFile(folder, 'REFERENCE_NUMBERS.txt', Buffer.from(referenceGuide(merged), 'utf8'));
     console.log(`[MEGA] Migration complete: ${merged.iesco.length} IESCO and ${merged.sngpl.length} SNGPL reference entries are now separated and labeled.`);
-    if (!merged.sngpl.length) throw new SyncFailure('No SNGPL references were found in Mega or BILL_REFS.');
+    if (!merged.sngpl.length) throw new SyncFailure('No SNGPL references were found in Mega, BILL_REFS, or SNGPL_REFS.');
     return true;
   } catch (error) {
     console.error(`[MEGA] Migration failed: ${error instanceof SyncFailure ? error.message : 'MEGA service, account, or network error.'}`);
