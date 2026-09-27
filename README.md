@@ -52,3 +52,12 @@ After resetting B2 history, the B2-backed checker was run successfully:
 - Local private files were removed from the GitHub Actions runner.
 
 One IESCO account returned no bill data during the test, so the run reported one data error. This is an upstream bill-page/fetch limitation, not a B2 or ntfy failure; the workflow remains successful and will retry it on the next hourly run.
+
+## Folder persistence test
+
+After moving the objects into `bill-checker/`, bill history was reset and the checker was run twice:
+
+- Run 1 restored **0 bill-state records**, fetched 8 IESCO and 5 SNGPL accounts, sent 12 ntfy updates, and uploaded **12** state records to `bill-checker/bill_state.json`.
+- Run 2 restored those **12 bill-state records**, completed successfully, uploaded the state again, and generated **0 new updates**. This confirms the server-side folder and history persistence are working.
+
+Each run writes to the same B2 object keys under `bill-checker/`. Backblaze may display prior uploads as file versions for recovery, but they are not separate application files; the current/latest object is what the workflow reads.
