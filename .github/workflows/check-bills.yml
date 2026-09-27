@@ -1,0 +1,65 @@
+name: Check Utility Bills
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bill-checker
+  cancel-in-progress: false
+
+jobs:
+  check-bills:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Mega dependencies
+        run: npm ci
+
+      - name: Install bill-checker dependencies
+        run: pip install 'requests[socks]'
+
+      # BILL_REFS is retained only as a one-time migration fallback. After the
+      # first successful upload, config.json in Mega is the source of truth.
+      - name: Download private bill data from Mega
+        id: mega_download
+        env:
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+          BILL_REFS: ${{ secrets.BILL_REFS }}
+        run: npm run mega:download
+
+      - name: Check bills
+        id: check_bills
+        env:
+          NTFY_KEY: ${{ secrets.NTFY_KEY }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_URLS: ${{ secrets.PROXY_URLS }}
+          PROXY_ONLY: ${{ vars.PROXY_ONLY }}
+        run: python check_bills.py
+
+      - name: Upload updated private bill data to Mega
+        if: ${{ always() && steps.mega_download.outcome == 'success' && steps.check_bills.outcome == 'success' }}
+        env:
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: npm run mega:upload
+
+      - name: Secure cleanup of local private data
+        if: always()
+        run: rm -f config.json bill_state.json config.json.*.tmp bill_state.json.*.tmp
