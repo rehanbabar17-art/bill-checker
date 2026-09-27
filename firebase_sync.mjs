@@ -118,15 +118,27 @@ function findFolder(folder, name) {
 
 async function openMega() {
   if (!MEGA_EMAIL || !MEGA_PASSWORD) throw new SyncFailure('MEGA_EMAIL and MEGA_PASSWORD Actions secrets are required for migration.');
-  const storage = await new Storage({ email: MEGA_EMAIL, password: MEGA_PASSWORD }).ready;
-  await storage.reload(true);
-  const rootData = findFolder(storage.root, 'github-data');
-  const billFolder = rootData ? findFolder(rootData, 'bill-checker') : undefined;
-  if (!billFolder) {
-    await storage.close().catch(() => undefined);
-    throw new SyncFailure('MEGA folder github-data/bill-checker was not found.');
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let storage;
+    try {
+      storage = await new Storage({ email: MEGA_EMAIL, password: MEGA_PASSWORD }).ready;
+      await storage.reload(true);
+      const rootData = findFolder(storage.root, 'github-data');
+      const billFolder = rootData ? findFolder(rootData, 'bill-checker') : undefined;
+      if (!billFolder) {
+        await storage.close().catch(() => undefined);
+        throw new SyncFailure('MEGA folder github-data/bill-checker was not found.');
+      }
+      return { storage, folder: billFolder };
+    } catch (error) {
+      lastError = error;
+      await storage?.close().catch(() => undefined);
+      if (error instanceof SyncFailure) throw error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+    }
   }
-  return { storage, folder: billFolder };
+  throw new SyncFailure('MEGA login or storage access failed after 3 attempts.');
 }
 
 async function megaFile(folder, name) {
