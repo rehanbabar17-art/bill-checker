@@ -1,0 +1,16 @@
+{
+  "name": "bill-checker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mega:download": "node mega_sync.mjs download",
+    "mega:upload": "node mega_sync.mjs upload",
+    "mega:initialize": "node mega_sync.mjs initialize",
+    "mega:verify": "node mega_sync.mjs verify"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "megajs": "^1.3.10"
+  }
+}

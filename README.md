@@ -1,48 +1,59 @@
 # Utility Bill Checker
 
-Automated IESCO electricity bill checker with ntfy notifications.
+Automated IESCO and SNGPL bill checker with ntfy notifications.
 
 ## Features
-- Checks configured IESCO accounts
+- Checks configured IESCO and SNGPL accounts
 - Detects new bills, amount changes, and payment status changes
 - Sends ntfy notifications with consumer name, reference number, bill month, amount, due date, and paid/unpaid status
-- Extracts the detailed IESCO QR payload from the official PITC bill page
-- Lists itemized charges: units, variable/fixed charges, meter/service rent, fuel surcharge, QTA, taxes, FPA, sanctioned load, and rate calculations
-- Tracks the complete bill response in `bill_state.json`
+- Extracts detailed IESCO charges and calculation data
+- Stores private configuration and bill history in Mega under `github-data/bill-checker`
 
 ## Security / Privacy
-All account reference numbers are **secret** and never committed to this repo:
-- On CI, refs are provided via the `BILL_REFS` GitHub Secret (JSON)
-- Locally, refs live in a git-ignored `config.json`
-- `bill_state.json` (bill history) is also git-ignored; on CI it is persisted via the Actions cache
+Account reference numbers and bill history are private and are never committed to this repository.
 
-## Setup
+- `config.json` and `bill_state.json` are downloaded from Mega before each check.
+- `BILL_REFS` remains a GitHub Secret only as a one-time migration/bootstrap fallback.
+- After the first successful run, `config.json` in Mega is the source of truth.
+- Local private files are securely removed from the GitHub Actions runner after each run.
 
-### GitHub Secrets
-The workflow requires these repository secrets:
+## GitHub Secrets
 | Secret | Purpose |
-|--------|---------|
-| `BILL_REFS` | JSON with account list, e.g. `{"iesco":[{"name":"KhalaLower","ref":"123..."}]}` |
+|---|---|
+| `MEGA_EMAIL` | Mega account email |
+| `MEGA_PASSWORD` | Mega account password |
+| `BILL_REFS` | Existing JSON account configuration, used only for first-time Mega initialization/migration |
 | `NTFY_KEY` | ntfy topic/key for notifications |
-| `PROXY_URL` | Proxy (or comma-separated list) used for all bill-site requests |
+| `PROXY_URL` | Proxy, or comma-separated proxy list, for bill-site requests |
 
-### Proxying
-The bill sites block many datacenter IP ranges, including GitHub Actions runners,
-so every request to a bill site goes through a proxy when one is configured:
+`BILL_REFS` uses the existing structure, for example:
 
-| Variable | Meaning |
-|----------|---------|
-| `PROXY_URL` / `PROXY_URLS` | One proxy URL, or several comma-separated; tried in order before a direct connection (`http://user:pass@host:port`, `socks5://...` with `requests[socks]`) |
-| `PROXY_ONLY` | `1` to never fall back to a direct connection |
-
-Standard `HTTPS_PROXY`/`HTTP_PROXY` are also honoured. Proxy credentials are
-masked in logs.
-
-### Local run
-Create a local `config.json` (git-ignored) with the same structure, then:
+```json
+{"iesco":[{"name":"KhalaLower","ref":"123..."}],"sngpl":[{"name":"Gas","consumer":"456..."}]}
 ```
+
+## First-time setup
+1. Add the secrets above to the repository.
+2. Run **Actions → Initialize Missing Mega Files** once. It creates `github-data/bill-checker/config.json` and an empty `bill_state.json` without overwriting existing files.
+3. Run **Actions → Verify Mega Storage** to confirm authentication and file validity.
+4. Run **Actions → Check Utility Bills**, or let the hourly schedule run.
+
+The regular workflow also supports one-time migration automatically: if the Mega config is absent, it validates `BILL_REFS`, uses it for that run, and uploads it to Mega after a successful bill check.
+
+## Proxying
+The bill sites may block datacenter IP ranges. `PROXY_URL` / `PROXY_URLS` can contain one proxy URL or several comma-separated URLs. `PROXY_ONLY=1` can be set as a repository variable to disable direct fallback.
+
+## Local run
+Create a git-ignored `config.json` with the same structure, then run:
+
+```bash
 python3 check_bills.py
 ```
 
-## Manual Run
-Go to Actions → Check Utility Bills → Run workflow
+To test Mega synchronization locally, set `MEGA_EMAIL` and `MEGA_PASSWORD`, then run `npm ci` followed by one of:
+
+```bash
+npm run mega:download
+npm run mega:upload
+npm run mega:verify
+```
