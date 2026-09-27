@@ -8,10 +8,15 @@
     "mega:upload": "node mega_sync.mjs upload",
     "mega:initialize": "node mega_sync.mjs initialize",
     "mega:migrate": "node mega_sync.mjs migrate",
-    "mega:verify": "node mega_sync.mjs verify"
+    "mega:verify": "node mega_sync.mjs verify",
+    "firebase:download": "node firebase_sync.mjs download",
+    "firebase:upload": "node firebase_sync.mjs upload",
+    "firebase:migrate-from-mega": "node firebase_sync.mjs migrate-from-mega",
+    "firebase:verify": "node firebase_sync.mjs verify"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
+    "firebase-admin": "^13.5.0",
     "megajs": "^1.3.10"
   }
 }
