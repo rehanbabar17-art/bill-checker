@@ -105,8 +105,55 @@ async function uploadRemoteFile(folder, name, data) {
 function legacyConfig() {
   const raw = process.env.BILL_REFS?.trim();
   if (!raw) return undefined;
-  parseConfig(raw);
-  return Buffer.from(raw, 'utf8');
+  return parseConfig(raw);
+}
+
+function normalizeConfig(config) {
+  const normalized = {
+    iesco: Array.isArray(config.iesco) ? config.iesco : [],
+    sngpl: Array.isArray(config.sngpl) ? config.sngpl : [],
+  };
+  if (typeof config.ntfy_key === 'string') normalized.ntfy_key = config.ntfy_key;
+  return normalized;
+}
+
+function accountKey(account, type) {
+  const reference = account.ref ?? account.consumer ?? '';
+  return `${type}:${account.name ?? ''}:${reference}`;
+}
+
+function mergeAccounts(existing, incoming, type) {
+  const merged = [...(existing ?? [])];
+  const seen = new Set(merged.map((account) => accountKey(account, type)));
+  for (const account of incoming ?? []) {
+    const key = accountKey(account, type);
+    if (!seen.has(key)) {
+      merged.push(account);
+      seen.add(key);
+    }
+  }
+  return merged;
+}
+
+function referenceGuide(config) {
+  const lines = [
+    'UTILITY BILL REFERENCE NUMBERS',
+    '================================',
+    '',
+    'IESCO REFERENCE NUMBERS',
+    '-----------------------',
+  ];
+  for (const account of config.iesco) {
+    lines.push(`${account.name ?? 'IESCO'}: ${account.ref ?? account.consumer ?? '(missing reference)'}`);
+  }
+  if (!config.iesco.length) lines.push('(none configured)');
+  lines.push('', 'SNGPL REFERENCE NUMBERS', '-----------------------');
+  for (const account of config.sngpl) {
+    lines.push(`${account.name ?? 'SNGPL'}: ${account.consumer ?? account.ref ?? '(missing reference)'}`);
+  }
+  if (!config.sngpl.length) lines.push('(none configured)');
+  lines.push('', 'This private guide is generated from config.json.', '');
+  return `${lines.join('\n')}\n`;
 }
 
 async function syncFromMega() {
@@ -117,10 +164,7 @@ async function syncFromMega() {
     if (!folder) throw new SyncFailure('MEGA folder github-data/bill-checker was not found.');
 
     const remoteConfig = await downloadRemoteFile(folder, 'config.json');
-    const configData = remoteConfig ?? legacyConfig();
-    if (!configData) {
-      throw new SyncFailure('MEGA config.json is missing and BILL_REFS was not provided for migration.');
-    }
+    const configData = remoteConfig ?? Buffer.from(JSON.stringify(legacyConfig(), null, 2) + '\n', 'utf8');
     parseConfig(configData);
 
     const remoteState = await downloadRemoteFile(folder, 'bill_state.json');
@@ -148,7 +192,7 @@ async function syncToMega() {
     if (!fs.existsSync(STATE_FILE)) throw new SyncFailure('Local bill_state.json is missing.');
     const configData = fs.readFileSync(CONFIG_FILE);
     const stateData = fs.readFileSync(STATE_FILE);
-    parseConfig(configData);
+    const config = parseConfig(configData);
     parseState(stateData);
 
     storage = await openStorage();
@@ -156,7 +200,8 @@ async function syncToMega() {
     if (!folder) throw new SyncFailure('Could not create MEGA folder github-data/bill-checker.');
     await uploadRemoteFile(folder, 'config.json', configData);
     await uploadRemoteFile(folder, 'bill_state.json', stateData);
-    console.log('[MEGA] Uploaded validated config.json and bill_state.json.');
+    await uploadRemoteFile(folder, 'REFERENCE_NUMBERS.txt', Buffer.from(referenceGuide(normalizeConfig(config)), 'utf8'));
+    console.log('[MEGA] Uploaded validated config.json, bill_state.json, and labeled REFERENCE_NUMBERS.txt.');
     return true;
   } catch (error) {
     console.error(`[MEGA] Upload failed: ${error instanceof SyncFailure ? error.message : 'MEGA service, account, or network error.'}`);
@@ -169,15 +214,16 @@ async function syncToMega() {
 async function initializeMega() {
   let storage;
   try {
-    const configData = legacyConfig();
-    if (!configData) throw new SyncFailure('BILL_REFS is required to initialize the private Mega configuration.');
+    const config = legacyConfig();
+    if (!config) throw new SyncFailure('BILL_REFS is required to initialize the private Mega configuration.');
     storage = await openStorage();
     const folder = await getBillFolder(storage, true);
     if (!folder) throw new SyncFailure('Could not create MEGA folder github-data/bill-checker.');
+    const normalized = normalizeConfig(config);
     if (newestFile(folder, 'config.json')) {
       console.log('[MEGA] Existing config.json found; preserved without modification.');
     } else {
-      await uploadRemoteFile(folder, 'config.json', configData);
+      await uploadRemoteFile(folder, 'config.json', Buffer.from(JSON.stringify(normalized, null, 2) + '\n', 'utf8'));
       console.log('[MEGA] Initialized config.json from BILL_REFS.');
     }
     if (newestFile(folder, 'bill_state.json')) {
@@ -186,9 +232,39 @@ async function initializeMega() {
       await uploadRemoteFile(folder, 'bill_state.json', Buffer.from('{}\n', 'utf8'));
       console.log('[MEGA] Initialized empty bill_state.json.');
     }
+    await uploadRemoteFile(folder, 'REFERENCE_NUMBERS.txt', Buffer.from(referenceGuide(normalized), 'utf8'));
+    console.log(`[MEGA] Wrote labeled guide: ${normalized.iesco.length} IESCO and ${normalized.sngpl.length} SNGPL reference entries.`);
     return true;
   } catch (error) {
     console.error(`[MEGA] Initialization failed: ${error instanceof SyncFailure ? error.message : 'MEGA service, account, or network error.'}`);
+    return false;
+  } finally {
+    await storage?.close().catch(() => undefined);
+  }
+}
+
+async function migrateMega() {
+  let storage;
+  try {
+    const incoming = legacyConfig();
+    if (!incoming) throw new SyncFailure('BILL_REFS is required to migrate IESCO/SNGPL references.');
+    storage = await openStorage();
+    const folder = await getBillFolder(storage, false);
+    if (!folder) throw new SyncFailure('The private MEGA folder github-data/bill-checker was not found.');
+    const remoteConfigData = await downloadRemoteFile(folder, 'config.json');
+    const remoteConfig = remoteConfigData ? parseConfig(remoteConfigData) : {};
+    const merged = normalizeConfig(remoteConfig);
+    merged.iesco = mergeAccounts(merged.iesco, incoming.iesco, 'iesco');
+    merged.sngpl = mergeAccounts(merged.sngpl, incoming.sngpl, 'sngpl');
+    if (typeof incoming.ntfy_key === 'string' && !merged.ntfy_key) merged.ntfy_key = incoming.ntfy_key;
+    const configData = Buffer.from(JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    await uploadRemoteFile(folder, 'config.json', configData);
+    await uploadRemoteFile(folder, 'REFERENCE_NUMBERS.txt', Buffer.from(referenceGuide(merged), 'utf8'));
+    console.log(`[MEGA] Migration complete: ${merged.iesco.length} IESCO and ${merged.sngpl.length} SNGPL reference entries are now separated and labeled.`);
+    if (!merged.sngpl.length) throw new SyncFailure('No SNGPL references were found in Mega or BILL_REFS.');
+    return true;
+  } catch (error) {
+    console.error(`[MEGA] Migration failed: ${error instanceof SyncFailure ? error.message : 'MEGA service, account, or network error.'}`);
     return false;
   } finally {
     await storage?.close().catch(() => undefined);
@@ -203,13 +279,16 @@ async function verifyMega() {
     if (!folder) throw new SyncFailure('The private MEGA bill-checker folder is missing.');
     const configData = await downloadRemoteFile(folder, 'config.json');
     const stateData = await downloadRemoteFile(folder, 'bill_state.json');
+    const guide = await downloadRemoteFile(folder, 'REFERENCE_NUMBERS.txt');
     if (!configData) throw new SyncFailure('config.json is missing.');
     if (!stateData) throw new SyncFailure('bill_state.json is missing.');
-    const config = parseConfig(configData);
+    if (!guide) throw new SyncFailure('REFERENCE_NUMBERS.txt is missing.');
+    const config = normalizeConfig(parseConfig(configData));
     const state = parseState(stateData);
     console.log('[MEGA-VERIFY] Authentication succeeded; private files are present and valid.');
-    console.log(`[MEGA-VERIFY] config.json: valid (${configData.length} bytes; ${(config.iesco ?? []).length} IESCO and ${(config.sngpl ?? []).length} SNGPL accounts).`);
+    console.log(`[MEGA-VERIFY] config.json: valid (${configData.length} bytes; ${config.iesco.length} IESCO and ${config.sngpl.length} SNGPL accounts).`);
     console.log(`[MEGA-VERIFY] bill_state.json: valid (${stateData.length} bytes; ${Object.keys(state).length} saved bill records).`);
+    console.log(`[MEGA-VERIFY] REFERENCE_NUMBERS.txt: present (${guide.length} bytes; labeled IESCO/SNGPL guide).`);
     return true;
   } catch (error) {
     console.error(`[MEGA-VERIFY] ${error instanceof SyncFailure ? error.message : 'MEGA login, storage access, or file reading failed.'}`);
@@ -223,8 +302,9 @@ const command = process.argv[2];
 const task = command === 'download' ? syncFromMega()
   : command === 'upload' ? syncToMega()
     : command === 'initialize' ? initializeMega()
-      : command === 'verify' ? verifyMega()
-        : Promise.reject(new Error('Usage: node mega_sync.mjs <download|upload|initialize|verify>'));
+      : command === 'migrate' ? migrateMega()
+        : command === 'verify' ? verifyMega()
+          : Promise.reject(new Error('Usage: node mega_sync.mjs <download|upload|initialize|migrate|verify>'));
 
 task.then((ok) => { if (!ok) process.exitCode = 1; }).catch((error) => {
   console.error(`[MEGA] ${error.message}`);

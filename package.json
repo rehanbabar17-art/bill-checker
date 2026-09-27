@@ -7,6 +7,7 @@
     "mega:download": "node mega_sync.mjs download",
     "mega:upload": "node mega_sync.mjs upload",
     "mega:initialize": "node mega_sync.mjs initialize",
+    "mega:migrate": "node mega_sync.mjs migrate",
     "mega:verify": "node mega_sync.mjs verify"
   },
   "dependencies": {
