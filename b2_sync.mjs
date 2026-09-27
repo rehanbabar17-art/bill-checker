@@ -87,7 +87,13 @@ async function b2Get(client, bucket, key, required = false) {
     return bodyBuffer(result.Body);
   } catch (error) {
     const status = error?.$metadata?.httpStatusCode;
-    if (!required && (status === 404 || error?.name === 'NoSuchKey' || error?.name === 'NotFound')) return undefined;
+    if (status === 404 || error?.name === 'NoSuchKey' || error?.name === 'NotFound') {
+      if (!required) return undefined;
+      throw new SyncFailure(`B2 object ${key} is missing from bucket ${bucket}.`);
+    }
+    if (status === 401 || status === 403 || /AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch/i.test(error?.name ?? '')) {
+      throw new SyncFailure(`B2 access was denied while reading ${key}; check the key ID, application key, bucket permission, and endpoint.`);
+    }
     if (error instanceof SyncFailure) throw error;
     throw new SyncFailure(`Could not read B2 object ${key}.`);
   }
