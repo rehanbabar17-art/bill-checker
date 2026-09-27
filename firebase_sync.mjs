@@ -14,6 +14,18 @@ const MEGA_PASSWORD = process.env.MEGA_PASSWORD;
 
 class SyncFailure extends Error {}
 
+function safeFailureCategory(error) {
+  const code = typeof error?.code === 'string' ? error.code : '';
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (message.includes('FIREBASE_SERVICE_ACCOUNT')) return 'Firebase service-account secret is missing, invalid JSON, or missing required fields.';
+  if (code === 'PERMISSION_DENIED' || /permission[_ ]denied|PERMISSION_DENIED/i.test(message)) return 'Firebase database permission was denied; check Realtime Database rules and service-account access.';
+  if (code === 'INVALID_ARGUMENT' || /invalid argument|invalid database/i.test(message)) return 'Firebase rejected the database URL or request configuration.';
+  if (/private key|PEM|DECODER|invalid_grant|unauthorized_client/i.test(message)) return 'Firebase rejected the service-account private key or authentication.';
+  if (/ENOTFOUND|ECONN|ETIMEDOUT|timed out|network/i.test(message)) return 'Firebase or Mega network request failed.';
+  if (/MEGA|EKEY|EPASSWORD|EBLOCKED|credentials/i.test(message)) return 'Mega authentication or storage access failed.';
+  return 'Firebase or Mega authentication, database, or network error.';
+}
+
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -144,7 +156,7 @@ async function downloadFromFirebase() {
     console.log('[FIREBASE] Restored config.json and bill_state.json from Firebase.');
     return true;
   } catch (error) {
-    console.error(`[FIREBASE] Download failed: ${error instanceof SyncFailure ? error.message : 'Firebase authentication, database, or network error.'}`);
+    console.error(`[FIREBASE] Download failed: ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
     return false;
   }
 }
@@ -159,7 +171,7 @@ async function uploadToFirebase() {
     console.log('[FIREBASE] Uploaded validated config, state, and labeled reference guide.');
     return true;
   } catch (error) {
-    console.error(`[FIREBASE] Upload failed: ${error instanceof SyncFailure ? error.message : 'Firebase authentication, database, or network error.'}`);
+    console.error(`[FIREBASE] Upload failed: ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
     return false;
   }
 }
@@ -183,7 +195,7 @@ async function migrateFromMega() {
     console.log(`[FIREBASE] Migration complete and verified: ${(verified.config.iesco ?? []).length} IESCO, ${(verified.config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(verified.state).length} bill-state records.`);
     return true;
   } catch (error) {
-    console.error(`[FIREBASE] Migration failed: ${error instanceof SyncFailure ? error.message : 'Firebase or MEGA authentication, database, or network error.'}`);
+    console.error(`[FIREBASE] Migration failed: ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
     return false;
   } finally {
     await storage?.close().catch(() => undefined);
@@ -198,7 +210,7 @@ async function verifyFirebase() {
     console.log(`[FIREBASE-VERIFY] Labeled reference guide is present (${data.guide.length} bytes).`);
     return true;
   } catch (error) {
-    console.error(`[FIREBASE-VERIFY] ${error instanceof SyncFailure ? error.message : 'Firebase authentication, database, or network error.'}`);
+    console.error(`[FIREBASE-VERIFY] ${error instanceof SyncFailure ? error.message : safeFailureCategory(error)}`);
     return false;
   }
 }
