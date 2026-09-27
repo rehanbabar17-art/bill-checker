@@ -11,8 +11,17 @@ const STATE_FILE = path.join(ROOT_DIR, 'bill_state.json');
 const FIREBASE_ROOT = 'bill-checker';
 const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASSWORD = process.env.MEGA_PASSWORD;
+const FIREBASE_TIMEOUT_MS = 20_000;
 
 class SyncFailure extends Error {}
+
+function withTimeout(promise, operation) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new SyncFailure(`Firebase ${operation} timed out after ${FIREBASE_TIMEOUT_MS / 1000} seconds.`)), FIREBASE_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 function safeFailureCategory(error) {
   const code = typeof error?.code === 'string' ? error.code : '';
@@ -148,7 +157,7 @@ async function megaFile(folder, name) {
 
 async function readFirebase() {
   const db = firebaseDatabase();
-  const snapshot = await db.ref(FIREBASE_ROOT).once('value');
+  const snapshot = await withTimeout(db.ref(FIREBASE_ROOT).once('value'), 'read');
   const value = snapshot.val();
   if (!isRecord(value)) throw new SyncFailure('Firebase bill-checker data is missing or has an invalid shape.');
   const config = value.config;
@@ -180,7 +189,7 @@ async function uploadToFirebase() {
     const config = parseConfig(fs.readFileSync(CONFIG_FILE));
     const state = parseState(fs.readFileSync(STATE_FILE));
     const db = firebaseDatabase();
-    await db.ref(FIREBASE_ROOT).set({ config, state, 'reference-guide': referenceGuide(config) });
+    await withTimeout(db.ref(FIREBASE_ROOT).set({ config, state, 'reference-guide': referenceGuide(config) }), 'write');
     console.log('[FIREBASE] Uploaded validated config, state, and labeled reference guide.');
     return true;
   } catch (error) {
@@ -203,10 +212,10 @@ async function migrateFromMega() {
     console.log(`[FIREBASE] Mega read succeeded: ${(config.iesco ?? []).length} IESCO and ${(config.sngpl ?? []).length} SNGPL accounts.`);
     console.log('[FIREBASE] Connecting to Firebase and writing the staged copy.');
     const db = firebaseDatabase();
-    const existing = await db.ref(FIREBASE_ROOT).once('value');
+    const existing = await withTimeout(db.ref(FIREBASE_ROOT).once('value'), 'read');
     const existingValue = existing.val();
     const state = isRecord(existingValue?.state) ? existingValue.state : {};
-    await db.ref(FIREBASE_ROOT).update({ config, state, 'reference-guide': guide });
+    await withTimeout(db.ref(FIREBASE_ROOT).update({ config, state, 'reference-guide': guide }), 'write');
     const verified = await readFirebase();
     console.log(`[FIREBASE] Migration complete and verified: ${(verified.config.iesco ?? []).length} IESCO, ${(verified.config.sngpl ?? []).length} SNGPL accounts, ${Object.keys(verified.state).length} Firebase bill-state records.`);
     return true;
@@ -234,7 +243,7 @@ async function verifyFirebase() {
 async function initializeFirebaseState() {
   try {
     const db = firebaseDatabase();
-    const existing = await db.ref(FIREBASE_ROOT).once('value');
+    const existing = await withTimeout(db.ref(FIREBASE_ROOT).once('value'), 'read');
     const value = existing.val();
     if (!isRecord(value?.config)) throw new SyncFailure('Firebase bill-checker/config must exist before initializing state.');
     if (isRecord(value.state)) {
@@ -242,10 +251,10 @@ async function initializeFirebaseState() {
       console.log(`[FIREBASE] Existing bill history preserved (${Object.keys(value.state).length} records).`);
       return true;
     }
-    await db.ref(`${FIREBASE_ROOT}/state`).set({});
-    await db.ref(`${FIREBASE_ROOT}/reference-guide`).set(typeof value['reference-guide'] === 'string'
+    await withTimeout(db.ref(`${FIREBASE_ROOT}/state`).set({}), 'write');
+    await withTimeout(db.ref(`${FIREBASE_ROOT}/reference-guide`).set(typeof value['reference-guide'] === 'string'
       ? value['reference-guide']
-      : referenceGuide(value.config));
+      : referenceGuide(value.config)), 'write');
     console.log('[FIREBASE] Initialized bill-checker/state directly in Firebase as an empty history object.');
     return true;
   } catch (error) {
