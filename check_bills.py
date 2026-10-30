@@ -888,14 +888,63 @@ def check_sngpl_bill(consumer):
 
 
 def send_ntfy(ntfy_key, title, message, tags="money,warning"):
-    url = f"https://ntfy.sh/{ntfy_key}"
     safe_title = re.sub(r"[^\x20-\x7E]", "", title).strip() or "Bill Update"
-    headers = {"Title": safe_title, "Priority": "high", "Tags": tags}
+    tag_list = [t.strip() for t in (tags or "money").split(",") if t.strip()]
+    # Ensure message is plain UTF-8 text well below ntfy's 4096-byte attachment threshold
+    clean_msg = (message or "").replace("\r\n", "\n").replace("\x00", "").strip()
+    while len(clean_msg.encode("utf-8")) > 3500:
+        clean_msg = clean_msg[:-100].rstrip() + "\n..."
+
+    # Publish as JSON to https://ntfy.sh so ntfy ALWAYS treats it as a text message (never a file attachment)
+    json_payload = json.dumps(
+        {
+            "topic": ntfy_key,
+            "title": safe_title,
+            "message": clean_msg,
+            "priority": 4,
+            "tags": tag_list,
+        }
+    ).encode("utf-8")
+    json_headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+    }
+    try:
+        if requests is not None:
+            r = requests.post(
+                "https://ntfy.sh",
+                data=json_payload,
+                headers=json_headers,
+                timeout=TIMEOUT,
+            )
+            if r.status_code == 200:
+                return True
+        else:
+            sess = _StdlibSession()
+            r = sess.post(
+                "https://ntfy.sh",
+                data=json_payload,
+                headers=json_headers,
+                timeout=TIMEOUT,
+            )
+            if r.status_code == 200:
+                return True
+    except Exception as e:
+        print(f"ntfy json error: {e}")
+
+    # Fallback to topic URL with explicit text/plain
+    url = f"https://ntfy.sh/{ntfy_key}"
+    headers = {
+        "Title": safe_title,
+        "Priority": "high",
+        "Tags": tags,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
     try:
         if requests is not None:
             r = requests.post(
                 url,
-                data=message.encode("utf-8"),
+                data=clean_msg.encode("utf-8"),
                 headers=headers,
                 timeout=TIMEOUT,
             )
@@ -903,7 +952,7 @@ def send_ntfy(ntfy_key, title, message, tags="money,warning"):
         sess = _StdlibSession()
         r = sess.post(
             url,
-            data=message.encode("utf-8"),
+            data=clean_msg.encode("utf-8"),
             headers=headers,
             timeout=TIMEOUT,
         )
@@ -913,28 +962,46 @@ def send_ntfy(ntfy_key, title, message, tags="money,warning"):
         return False
 
 
+def format_notification_title(ch):
+    b = ch["bill"]
+    status = b.get("status", "UNPAID")
+    amount = b.get("amount", "N/A")
+    due = b.get("due_date", "N/A")
+    if status == "PAID":
+        return f"PAID: {ch['name']} ({ch['type']}) - Rs. {amount}"
+    return f"UNPAID: {ch['name']} ({ch['type']}) - Rs. {amount} (Due {due})"
+
+
 def format_notification_block(ch):
     b = ch["bill"]
     status = b.get("status", "UNPAID")
     pay_date = b.get("payment_date") or (b.get("breakup") or {}).get("Payment Date")
-    header_tag = "Bill PAID" if status == "PAID" else "Bill Update"
-    block = (
-        f"[{header_tag}] {ch['name']} ({ch['type']})\n"
-        f"Ref: {ch['ref']}\n"
-        f"Consumer: {b.get('consumer_name', 'N/A')}\n"
-        f"Bill month: {b.get('bill_month', 'N/A')}\n"
-        f"Amount: Rs. {b.get('amount', 'N/A')}\n"
-        f"Due: {b.get('due_date', 'N/A')}\n"
-        f"Status: {status}"
-        + (f"\nPayment Date: {pay_date}" if pay_date else "")
-    )
+    after_due = b.get("after_due") or (b.get("breakup") or {}).get("Payable After Due Date")
+    header_tag = "BILL PAID" if status == "PAID" else "BILL UNPAID"
+    lines = [
+        f"[{header_tag}] {ch['name']} ({ch['type']})",
+        f"Ref: {ch['ref']}",
+        f"Consumer: {b.get('consumer_name', 'N/A')}",
+        f"Bill Month: {b.get('bill_month', 'N/A')}",
+        f"Amount Within Due Date: Rs. {b.get('amount', 'N/A')}",
+    ]
+    if after_due:
+        lines.append(f"Amount After Due Date: Rs. {after_due}")
+    lines.append(f"Due Date: {b.get('due_date', 'N/A')}")
+    lines.append(f"Payment Status: {status}")
+    if pay_date:
+        lines.append(f"Payment Date: {pay_date}")
+
     breakup = b.get("breakup")
     if breakup:
-        parts = [
-            f"  {k}: Rs. {v}" if k != "Payment Date" else f"  {k}: {v}"
-            for k, v in breakup.items()
-        ]
-        block += "\nBreakup:\n" + "\n".join(parts)
+        b_lines = []
+        for k, v in breakup.items():
+            if k == "Payment Date":
+                continue
+            b_lines.append(f"  - {k}: Rs. {v}")
+        if b_lines:
+            lines.append("\nBreakup of Total Amount:")
+            lines.extend(b_lines)
 
     calc = b.get("calc")
     if calc:
@@ -942,38 +1009,41 @@ def format_notification_block(ch):
         if "energy" in calc:
             e = calc["energy"]
             labels = {
-                "units": "Units",
+                "units": "Units Consumed",
                 "fixed_chrg": "Fixed Charge",
                 "variable_chrg": "Variable Charge",
                 "meter_rent": "Meter Rent",
                 "service_rent": "Service Rent",
-                "fc_sur": "Fuel Surcharge",
-                "qta": "Subsidy (QTA)",
+                "fc_sur": "F.C Surcharge",
+                "qta": "Qtr Tariff Adj (QTA)",
             }
             for key, label in labels.items():
                 if key in e:
                     suffix = "" if key == "units" else "Rs. "
-                    parts.append(f"  {label}: {suffix}{e[key]}")
+                    parts.append(f"  - {label}: {suffix}{e[key]}")
         if "gas" in calc:
             g = calc["gas"]
             if g.get("hm3"):
-                parts.append(f"  Gas Consumed: {g['hm3']} HM3 ({g.get('mmbtu', '0')} MMBTU)")
+                parts.append(f"  - Gas Consumed: {g['hm3']} HM3 ({g.get('mmbtu', '0')} MMBTU)")
             if g.get("rate_slabs"):
-                parts.append(f"  Slab: {' / '.join(g['rate_slabs'])}")
+                parts.append(f"  - Slab: {' / '.join(g['rate_slabs'])}")
         if "taxes" in calc:
             for tk, tv in calc["taxes"].items():
-                parts.append(f"  {tk.upper()}: Rs. {tv}")
+                parts.append(f"  - {tk.upper()}: Rs. {tv}")
         if "fpa" in calc:
             for fk, fv in calc["fpa"].items():
                 label = "FPA Energy" if fk == "fpa_energy" else "FPA GST"
-                parts.append(f"  {label}: Rs. {fv}")
+                parts.append(f"  - {label}: Rs. {fv}")
         if "bill_calc" in calc:
-            parts.append(f"  Rate: {' / '.join(calc['bill_calc'])}")
+            safe_rates = [r.replace("×", "x") for r in calc["bill_calc"]]
+            parts.append(f"  - Rate Slab: {' / '.join(safe_rates)}")
         if "san_load" in calc:
-            parts.append(f"  Sanctioned Load: {calc['san_load']} kW")
+            parts.append(f"  - Sanctioned Load: {calc['san_load']} kW")
         if parts:
-            block += "\nCalculation:\n" + "\n".join(parts)
-    return block
+            lines.append("\nTariff & QR Calculation:")
+            lines.extend(parts)
+
+    return "\n".join(lines)
 
 
 def main():
@@ -993,6 +1063,9 @@ def main():
     else:
         print("Proxies: none configured (direct connections)")
     print()
+
+    force_all = _env_bool("FORCE_NOTIFY_ALL")
+    force_paid = _env_bool("FORCE_NOTIFY_PAID")
 
     print("--- IESCO Bills ---")
     for account in config.get("iesco") or []:
@@ -1040,31 +1113,38 @@ def main():
             new_status = bill.get("status") or old_status or "UNPAID"
             bill["status"] = new_status
 
+            separate_sig = f"{new_month}|{new_status}|{new_amount}"
+            needs_separate_notify = old.get("notified_separate_sig") != separate_sig
             paid_needs_notify = new_status == "PAID" and (
                 old_status != "PAID"
                 or old.get("notified_paid_month") != new_month
-                or _env_bool("FORCE_NOTIFY_PAID")
+                or force_paid
             )
 
-            if (
+            should_notify = (
                 new_month != old_month
                 or new_amount != old_amount
                 or new_status != old_status
-                or not old.get("breakup")
                 or paid_needs_notify
-            ):
+                or needs_separate_notify
+                or force_all
+            )
+
+            if should_notify or not old.get("breakup"):
                 print(
                     f"  UPDATE: Rs. {bill['amount']} | Due: {bill.get('due_date', 'N/A')} | "
                     f"Month: {new_month} | Status: {new_status} | Breakup keys: {len(bill.get('breakup') or {})}"
                 )
-                if (
-                    new_month != old_month
-                    or new_amount != old_amount
-                    or new_status != old_status
-                    or paid_needs_notify
-                ):
+                if should_notify:
                     changes.append(
-                        {"key": key, "type": "IESCO", "name": name, "ref": ref, "bill": bill}
+                        {
+                            "key": key,
+                            "type": "IESCO",
+                            "name": name,
+                            "ref": ref,
+                            "bill": bill,
+                            "separate_sig": separate_sig,
+                        }
                     )
             else:
                 print(
@@ -1076,8 +1156,10 @@ def main():
                 b_summary = ", ".join(f"{k}: {v}" for k, v in bill["breakup"].items())
                 print(f"  Breakup: {b_summary}")
 
-            if new_status == "PAID" and old.get("notified_paid_month") == new_month:
+            if old.get("notified_paid_month") == new_month:
                 bill["notified_paid_month"] = new_month
+            if old.get("notified_separate_sig") == separate_sig:
+                bill["notified_separate_sig"] = separate_sig
             bill.pop("source", None)
             state[key] = bill
         except Exception as e:
@@ -1115,27 +1197,29 @@ def main():
                 bill["status"] = "PAID"
             new_status = bill.get("status", "UNPAID")
 
+            separate_sig = f"{new_month}|{new_status}|{new_amount}"
+            needs_separate_notify = old.get("notified_separate_sig") != separate_sig
             paid_needs_notify = new_status == "PAID" and (
-                old_status != "PAID" or old.get("notified_paid_month") != new_month
+                old_status != "PAID"
+                or old.get("notified_paid_month") != new_month
+                or force_paid
             )
 
-            if (
+            should_notify = (
                 new_month != old_month
                 or new_amount != old_amount
                 or new_status != old_status
-                or not old.get("breakup")
                 or paid_needs_notify
-            ):
+                or needs_separate_notify
+                or force_all
+            )
+
+            if should_notify or not old.get("breakup"):
                 print(
                     f"  UPDATE: Rs. {bill['amount']} | Due: {bill.get('due_date', 'N/A')} | "
                     f"Month: {new_month} | Status: {new_status} | Breakup keys: {len(bill.get('breakup') or {})}"
                 )
-                if (
-                    new_month != old_month
-                    or new_amount != old_amount
-                    or new_status != old_status
-                    or paid_needs_notify
-                ):
+                if should_notify:
                     changes.append(
                         {
                             "key": key,
@@ -1143,6 +1227,7 @@ def main():
                             "name": name,
                             "ref": consumer,
                             "bill": bill,
+                            "separate_sig": separate_sig,
                         }
                     )
             else:
@@ -1155,8 +1240,10 @@ def main():
                 b_summary = ", ".join(f"{k}: {v}" for k, v in bill["breakup"].items())
                 print(f"  Breakup: {b_summary}")
 
-            if new_status == "PAID" and old.get("notified_paid_month") == new_month:
+            if old.get("notified_paid_month") == new_month:
                 bill["notified_paid_month"] = new_month
+            if old.get("notified_separate_sig") == separate_sig:
+                bill["notified_separate_sig"] = separate_sig
             bill.pop("source", None)
             state[key] = bill
         except Exception as e:
@@ -1166,24 +1253,23 @@ def main():
     if changes:
         ntfy_key = os.environ.get("NTFY_KEY", config.get("ntfy_key", ""))
         if ntfy_key:
-            lines = [format_notification_block(ch) for ch in changes]
-            msg = "\n\n".join(lines)
-            all_paid = all(ch["bill"].get("status") == "PAID" for ch in changes)
-            title = (
-                f"{len(changes)} Bill(s) PAID Confirmation"
-                if all_paid
-                else f"{len(changes)} Bill Update(s)"
-            )
-            tags = "white_check_mark,credit_card" if all_paid else "money,warning"
-            if send_ntfy(ntfy_key, title, msg, tags=tags):
-                for ch in changes:
-                    if ch["bill"].get("status") == "PAID" and ch.get("key") in state:
-                        state[ch["key"]]["notified_paid_month"] = ch["bill"].get(
-                            "bill_month"
-                        )
-                print(f"\nntfy sent for {len(changes)} change(s)")
-            else:
-                print("\nntfy send failed")
+            sent_count = 0
+            for ch in changes:
+                is_paid = ch["bill"].get("status") == "PAID"
+                title = format_notification_title(ch)
+                msg = format_notification_block(ch)
+                tags = "white_check_mark,credit_card" if is_paid else "money,warning"
+                if send_ntfy(ntfy_key, title, msg, tags=tags):
+                    sent_count += 1
+                    b_key = ch.get("key")
+                    if b_key in state:
+                        state[b_key]["notified_separate_sig"] = ch.get("separate_sig", "")
+                        if is_paid:
+                            state[b_key]["notified_paid_month"] = ch["bill"].get("bill_month")
+                    print(f"  -> ntfy sent separately for {ch['name']} ({ch['bill'].get('status')})")
+                else:
+                    print(f"  -> ntfy send failed for {ch['name']}")
+            print(f"\nntfy sent {sent_count}/{len(changes)} separate notification(s)")
 
     save_state(state)
 
